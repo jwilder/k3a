@@ -1,0 +1,220 @@
+#cloud-config
+
+# Complete VM setup for k3a cluster nodes
+# Includes all packages needed for Kubernetes/kubeadm installation
+
+package_update: true
+
+packages:
+  - curl
+  - wget
+  - git
+  - unzip
+  - ca-certificates
+  - moby-runc
+  - moby-containerd
+
+# Complete system setup for Kubernetes
+runcmd:
+  # Install Azure CLI for CBL-Mariner (RPM-based)
+  - sudo rpm --import https://packages.microsoft.com/keys/microsoft.asc
+  - |
+    cat <<EOF | sudo tee /etc/yum.repos.d/azure-cli.repo
+    [azure-cli]
+    name=Azure CLI
+    baseurl=https://packages.microsoft.com/yumrepos/azure-cli
+    enabled=1
+    gpgcheck=1
+    gpgkey=https://packages.microsoft.com/keys/microsoft.asc
+    EOF
+  - sudo tdnf install -y azure-cli
+  
+  # Setup container runtime
+  - sudo systemctl enable --now containerd
+  - sudo mkdir -p /etc/containerd
+  - sudo containerd config default | sudo tee /etc/containerd/config.toml
+  - sudo sed -i 's/SystemdCgroup = false/SystemdCgroup = true/g' /etc/containerd/config.toml
+  - sudo systemctl restart containerd
+  
+  # Setup Kubernetes kernel modules and networking
+  - |
+    sudo tee /etc/modules-load.d/k8s.conf <<EOF
+    overlay
+    br_netfilter
+    EOF
+  - sudo modprobe overlay
+  - sudo modprobe br_netfilter
+  - |
+    sudo tee /etc/sysctl.d/k8s.conf <<EOF
+    net.bridge.bridge-nf-call-iptables  = 1
+    net.bridge.bridge-nf-call-ip6tables = 1
+    net.ipv4.ip_forward                 = 1
+    EOF
+  - sudo sysctl --system
+  
+  # Disable swap
+  - sudo swapoff -a
+  - sudo sed -i '/ swap / s/^\(.*\)$/#\1/g' /etc/fstab
+  
+  # Setup Kubernetes repository and install packages
+  - |
+    sudo tee /etc/yum.repos.d/kubernetes.repo <<EOF
+    [kubernetes]
+    name=Kubernetes
+    baseurl=https://pkgs.k8s.io/core:/stable:/{{.K8sMinorVersion}}/rpm/
+    enabled=1
+    gpgcheck=1
+    gpgkey=https://pkgs.k8s.io/core:/stable:/{{.K8sMinorVersion}}/rpm/repodata/repomd.xml.key
+    EOF
+  - sudo tdnf install -y kubelet kubeadm kubectl
+  - sudo systemctl enable kubelet
+  
+  # Ensure azureuser has proper SSH directory
+  - sudo -u azureuser mkdir -p /home/azureuser/.ssh
+  - sudo -u azureuser chmod 700 /home/azureuser/.ssh
+  
+  # Set hostname based on instance metadata (normalize Azure VMSS naming)
+  - |
+    INSTANCE_NAME=$(curl -s -H Metadata:true "http://169.254.169.254/metadata/instance/compute/name?api-version=2021-02-01&format=text" 2>/dev/null || echo "k3a-node")
+    # Convert Azure VMSS naming (poolname-vmss_N) to consistent format (poolname-NNNNNN)
+    if [[ "$INSTANCE_NAME" =~ ^(.+)-vmss_([0-9]+)$ ]]; then
+      POOL_NAME="${BASH_REMATCH[1]}"
+      INSTANCE_ID="${BASH_REMATCH[2]}"
+      NORMALIZED_NAME=$(printf "%s-%06d" "$POOL_NAME" "$INSTANCE_ID")
+      hostnamectl set-hostname "$NORMALIZED_NAME"
+    else
+      hostnamectl set-hostname "$INSTANCE_NAME"
+    fi
+  
+  # Basic system optimization
+  - echo 'vm.swappiness=10' >> /etc/sysctl.conf
+  - sysctl -p
+
+  # Configure iptables rules for Kubernetes (required before joining cluster)
+  - sudo iptables -I INPUT -p tcp --dport 6443 -j ACCEPT
+  - sudo iptables -I INPUT -p tcp --dport 10250 -j ACCEPT
+  - sudo iptables -I INPUT -p tcp --dport 10259 -j ACCEPT
+  - sudo iptables -I INPUT -p tcp --dport 10257 -j ACCEPT
+  - sudo iptables -I INPUT -p tcp --dport 30000:32767 -j ACCEPT
+  - sudo iptables -I INPUT -p udp --dport 10244 -j ACCEPT
+  - sudo iptables -I INPUT -p udp --dport 8472 -j ACCEPT
+  - sudo iptables -I INPUT -p tcp --dport 179 -j ACCEPT
+  - sudo iptables -I INPUT -i flannel.1 -j ACCEPT
+  - sudo iptables -I INPUT -i cni0 -j ACCEPT
+  - sudo mkdir -p /etc/iptables
+  - sudo sh -c 'iptables-save > /etc/iptables/rules.v4'
+
+  # Create systemd service for worker node auto-join (more reliable than cloud-init)
+  - |
+    if [ "{{.Role}}" = "worker" ]; then
+      # Make script executable and enable service
+      chmod +x /usr/local/bin/k3a-worker-join.sh
+      systemctl daemon-reload
+      systemctl enable k3a-worker-join.service
+      systemctl start k3a-worker-join.service
+    fi
+
+write_files:
+  # Create worker auto-join script
+  - path: /usr/local/bin/k3a-worker-join.sh
+    content: |
+      #!/bin/bash
+
+      LOG_FILE="/var/log/k3a-worker-join.log"
+      STATUS_FILE="/var/lib/cloud/k3a-worker-status"
+
+      log() {
+          echo "$(date): $1" | tee -a "$LOG_FILE"
+      }
+
+      # Check if already joined
+      if [ -f "$STATUS_FILE" ] && [ "$(cat $STATUS_FILE)" = "worker-joined" ]; then
+          log "Worker node already joined cluster, exiting"
+          exit 0
+      fi
+
+      log "Starting worker node auto-join process..."
+
+      # Wait for Azure CLI to be available
+      timeout 300 bash -c 'until az --version >/dev/null 2>&1; do sleep 5; done' || {
+          log "Azure CLI not available after timeout"
+          exit 1
+      }
+
+      # Login using managed identity
+      log "Logging in with managed identity..."
+      if ! az login --identity >> "$LOG_FILE" 2>&1; then
+          log "Failed to login with managed identity"
+          exit 1
+      fi
+
+      # Wait for worker join token to be available in Key Vault
+      KEYVAULT_NAME="{{.KeyVaultName}}"
+      SECRET_NAME="{{.ResourceGroup}}-worker-join"
+
+      log "Waiting for worker join token from Key Vault: $KEYVAULT_NAME"
+      for i in {1..60}; do
+          if JOIN_COMMAND=$(az keyvault secret show --vault-name "$KEYVAULT_NAME" --name "$SECRET_NAME" --query "value" --output tsv 2>/dev/null); then
+              log "Retrieved worker join command"
+              break
+          fi
+          log "Attempt $i: Worker join token not yet available, waiting..."
+          sleep 10
+      done
+
+      if [ -z "$JOIN_COMMAND" ]; then
+          log "Failed to retrieve worker join command after 10 minutes"
+          exit 1
+      fi
+
+      # Execute the join command
+      log "Executing kubeadm join..."
+      if eval "sudo $JOIN_COMMAND" >> "$LOG_FILE" 2>&1; then
+          log "Worker node successfully joined the cluster!"
+          echo "worker-joined" > "$STATUS_FILE"
+          exit 0
+      else
+          log "Failed to join worker node to cluster"
+          echo "worker-join-failed" > "$STATUS_FILE"
+          exit 1
+      fi
+    permissions: '0755'
+    owner: root:root
+
+  # Create systemd service file
+  - path: /etc/systemd/system/k3a-worker-join.service
+    content: |
+      [Unit]
+      Description=K3A Worker Node Auto-Join Service
+      After=network-online.target
+      Wants=network-online.target
+      StartLimitIntervalSec=0
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/bin/k3a-worker-join.sh
+      Restart=on-failure
+      RestartSec=30
+      StandardOutput=journal
+      StandardError=journal
+      User=root
+
+      [Install]
+      WantedBy=multi-user.target
+    permissions: '0644'
+    owner: root:root
+
+  # Create a marker file to indicate cloud-init completion
+  - path: /var/lib/cloud/k3a-ready
+    content: |
+      Cloud-init setup completed for k3a cluster node
+      All Kubernetes prerequisites installed
+      Timestamp: $(date)
+    permissions: '0644'
+
+# Ensure services are enabled
+bootcmd:
+  - systemctl enable sshd
+
+# Final message
+final_message: "k3a node cloud-init setup completed. All prerequisites installed. Ready for kubeadm cluster initialization via SSH."
