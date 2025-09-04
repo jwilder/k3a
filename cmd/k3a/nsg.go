@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/jwilder/k3a/nsg"
+	"github.com/vpatelsj/k3a/nsg"
 	"github.com/spf13/cobra"
 )
 

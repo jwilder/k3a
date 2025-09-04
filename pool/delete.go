@@ -10,7 +10,7 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork"
-	kstrings "github.com/jwilder/k3a/pkg/strings"
+	kstrings "github.com/vpatelsj/k3a/pkg/strings"
 )
 
 type DeletePoolArgs struct {

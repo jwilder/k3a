@@ -14,8 +14,8 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/msi/armmsi"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork"
-	"github.com/jwilder/k3a/loadbalancer/rule"
-	kstrings "github.com/jwilder/k3a/pkg/strings"
+	"github.com/vpatelsj/k3a/loadbalancer/rule"
+	kstrings "github.com/vpatelsj/k3a/pkg/strings"
 )
 
 type CreatePoolArgs struct {
@@ -29,14 +29,19 @@ type CreatePoolArgs struct {
 	K8sVersion     string   // New field for Kubernetes version
 	SKU            string   // VM SKU type
 	OSDiskSizeGB   int      // OS disk size in GB
+	StorageType    string   // Storage account type for OS disk (optional)
 	MSIIDs         []string // Additional user-assigned MSI resource IDs
+	EtcdEndpoint   string   // Etcd endpoint for external datastore
+	UsePostgres    bool     // Use PostgreSQL instead of etcd
+	PostgresName   string   // PostgreSQL server name
+	PostgresSuffix string   // PostgreSQL server suffix (e.g., postgres.database.azure.com)
 }
 
 //go:embed cloud-init.yaml
 var cloudInitFS embed.FS
 
 // getCloudInitData renders the cloud-init template and returns base64-encoded data
-func getCloudInitData(tmplData map[string]string) (string, error) {
+func getCloudInitData(tmplData map[string]interface{}) (string, error) {
 	cloudInitBytes, err := cloudInitFS.ReadFile("cloud-init.yaml")
 	if err != nil {
 		return "", fmt.Errorf("failed to read embedded cloud-init.yaml: %w", err)
@@ -256,20 +261,23 @@ func Create(args CreatePoolArgs) error {
 	}
 
 	keyVaultName := fmt.Sprintf("k3akv%s", clusterHash)
-	posgresName := fmt.Sprintf("k3apg%s", clusterHash)
 	storageAccountName := fmt.Sprintf("k3astorage%s", clusterHash)
-	tmplData := map[string]string{
-		"PostgresURL":        "",
+	tmplData := map[string]interface{}{
 		"KeyVaultName":       keyVaultName,
-		"PostgresName":       posgresName,
-		"PostgresSuffix":     "postgres.database.azure.com",
 		"Role":               role,
 		"StorageAccountName": storageAccountName,
 		"ResourceGroup":      cluster,
 		"ExternalIP":         externalIP,
 		"K8sVersion":         args.K8sVersion, // Pass version to template
 		"MSIClientID":        *msi.Properties.ClientID,
+		"EtcdEndpoint":       args.EtcdEndpoint,
+		"UsePostgres":        args.UsePostgres, // Pass as boolean, not string
+		"PostgresName":       args.PostgresName,
+		"PostgresSuffix":     args.PostgresSuffix,
 	}
+
+	// Debug output to verify template data
+	fmt.Printf("DEBUG: UsePostgres=%t, EtcdEndpoint=%s\n", args.UsePostgres, args.EtcdEndpoint)
 
 	customDataB64, err := getCloudInitData(tmplData)
 	if err != nil {
@@ -303,6 +311,25 @@ func Create(args CreatePoolArgs) error {
 		inboundNatPools = nil
 	}
 
+	// Determine storage account type - default to Premium SSD for higher IOPS
+	var storageAccountType armcompute.StorageAccountTypes
+	switch args.StorageType {
+	case "UltraSSD_LRS":
+		storageAccountType = armcompute.StorageAccountTypesUltraSSDLRS
+	case "Premium_LRS":
+		storageAccountType = armcompute.StorageAccountTypesPremiumLRS
+	case "StandardSSD_LRS":
+		storageAccountType = armcompute.StorageAccountTypesStandardSSDLRS
+	case "Standard_LRS":
+		storageAccountType = armcompute.StorageAccountTypesStandardLRS
+	case "PremiumV2_LRS":
+		storageAccountType = armcompute.StorageAccountTypesPremiumV2LRS
+	default:
+		// Default to Premium SSD for best IOPS performance
+		storageAccountType = armcompute.StorageAccountTypesPremiumLRS
+	}
+
+	// Configure storage profile with Premium SSD for higher IOPS performance
 	storageProfile := &armcompute.VirtualMachineScaleSetStorageProfile{
 		ImageReference: &armcompute.ImageReference{
 			Publisher: to.Ptr("MicrosoftCblMariner"),
@@ -312,8 +339,9 @@ func Create(args CreatePoolArgs) error {
 		},
 		OSDisk: &armcompute.VirtualMachineScaleSetOSDisk{
 			CreateOption: to.Ptr(armcompute.DiskCreateOptionTypesFromImage),
+			Caching:      to.Ptr(armcompute.CachingTypesReadWrite),
 			ManagedDisk: &armcompute.VirtualMachineScaleSetManagedDiskParameters{
-				StorageAccountType: to.Ptr(armcompute.StorageAccountTypesStandardLRS),
+				StorageAccountType: to.Ptr(storageAccountType),
 			},
 			DiskSizeGB: to.Ptr(int32(args.OSDiskSizeGB)),
 		},

@@ -1,0 +1,34 @@
+# IRQ Balancing Configuration for K3s Optimization
+# 
+# Save this as: /etc/sysconfig/irqbalance
+#
+# This configuration reserves CPU cores for K3s and uses remaining cores
+# for interrupt handling and system processes.
+
+# IRQ balancing configuration for k3s optimization
+# Reserve cores 0-47 for k3s, use cores 48-63 for IRQs and system processes
+# 
+# CPU mask calculation for different systems:
+# - 64-core: IRQBALANCE_BANNED_CPUS=000000000000ffffffffffff (cores 0-47 banned)
+# - 32-core: IRQBALANCE_BANNED_CPUS=00000000ffffff00 (cores 0-23 banned)
+# - 16-core: IRQBALANCE_BANNED_CPUS=00000fff (cores 0-11 banned)
+# 
+# For 64-core systems (default):
+IRQBALANCE_BANNED_CPUS=000000000000ffffffffffff
+
+# For 32-core systems (uncomment and use instead):
+# IRQBALANCE_BANNED_CPUS=00000000ffffff00
+
+# For 16-core systems (uncomment and use instead):
+# IRQBALANCE_BANNED_CPUS=00000fff
+
+# Enable debug mode for troubleshooting (uncomment if needed)
+# IRQBALANCE_DEBUG=1
+
+# Use power management for better efficiency
+IRQBALANCE_ARGS="--powerthresh=20"
+
+# Additional options:
+# --policyscript=/path/to/script  # Custom policy script
+# --oneshot                       # Run once and exit
+# --banirq=IRQ_NUMBER            # Ban specific IRQ numbers

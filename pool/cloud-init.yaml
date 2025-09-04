@@ -13,7 +13,18 @@ write_files:
     content: |
       mirrors:
         registry.internal:
-
+  - path: /etc/rancher/k3s/scheduler-config.yaml
+    permissions: '0644'
+    content: |
+      apiVersion: kubescheduler.config.k8s.io/v1
+      kind: KubeSchedulerConfiguration
+      clientConnection:
+        kubeconfig: "/var/lib/rancher/k3s/server/cred/scheduler.kubeconfig"
+        qps: 300
+        burst: 400
+      percentageOfNodesToScore: 1
+      profiles:
+        - schedulerName: default-scheduler
 {{- if eq .Role "control-plane" }}
   - path: /usr/local/bin/update-peers.sh
     permissions: '0755'
@@ -92,34 +103,6 @@ write_files:
 
       [Install]
       WantedBy=multi-user.target
-  - path: /usr/local/bin/watch-and-label-nodes.sh
-    permissions: '0755'
-    content: |
-      #!/bin/bash
-      while true; do
-        kubectl get nodes -o json | jq -r '.items[] | select((.metadata.labels["node-role.kubernetes.io/worker"] == null) and (.metadata.labels["node-role.kubernetes.io/control-plane"] == null) and ((now - (.metadata.creationTimestamp | fromdateiso8601)) > 10)) | .metadata.name' | while read -r node; do
-          kubectl label node "$node" node-role.kubernetes.io/worker=worker --overwrite
-        done
-        sleep 60
-      done
-  - path: /etc/systemd/system/k3s-node-labeler.service
-    permissions: '0644'
-    content: |
-      [Unit]
-      Description=K3s Node Auto-Labeler
-      After=network-online.target k3s.service
-      Wants=network-online.target
-
-      [Service]
-      Type=simple
-      ExecStart=/usr/local/bin/watch-and-label-nodes.sh
-      Restart=always
-      RestartSec=10
-      StandardOutput=journal
-      StandardError=journal
-
-      [Install]
-      WantedBy=multi-user.target
 {{- end }}
 
 runcmd:
@@ -130,15 +113,22 @@ runcmd:
   - iptables -A INPUT -p udp --dport 5001 -j ACCEPT
   - iptables -A INPUT -p icmp -j ACCEPT
   - iptables -A INPUT -p udp --dport 8472 -j ACCEPT
+  - iptables -A INPUT -p tcp --dport 2379 -j ACCEPT
+  - iptables -A INPUT -p tcp --dport 2380 -j ACCEPT
   - az login --identity --client-id "{{ .MSIClientID }}"
+  {{- if .UsePostgres }}
   - export POSTGRES_PASSWORD=$(az keyvault secret show --vault-name "{{.KeyVaultName}}" --name "postgres-admin-password" --query value -o tsv)
   - export POSTGRES_PASSWORD_ESCAPED=$(python3 -c "import urllib.parse,os; print(urllib.parse.quote(os.environ['POSTGRES_PASSWORD']))")
+  {{- end }}
   - |
     {{- if eq .Role "control-plane" }}
-    curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION="{{ .K8sVersion }}+k3s1" sh -s - server --token=SECRET --tls-san {{ .ExternalIP }} --embedded-registry --datastore-endpoint="postgres://azureuser:${POSTGRES_PASSWORD_ESCAPED}@{{.PostgresName}}.{{.PostgresSuffix}}:5432/postgres"
+    {{- if .UsePostgres }}
+    curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION="{{ .K8sVersion }}+k3s1" sh -s - server --token=SECRET --tls-san {{ .ExternalIP }} --embedded-registry --cluster-cidr=16.0.0.0/5 --service-cidr=172.20.0.0/16 --kube-controller-manager-arg=node-cidr-mask-size=22 --kubelet-arg=max-pods=300 --datastore-endpoint="postgres://azureuser:${POSTGRES_PASSWORD_ESCAPED}@{{.PostgresName}}.{{.PostgresSuffix}}:5432/postgres" --etcd-disable-snapshots --disable=traefik,local-path,core-dns,metrics-server --enable-pprof --kube-apiserver-arg=etcd-compaction-interval=0 --kube-scheduler-arg=config=/etc/rancher/k3s/scheduler-config.yaml --pause-image=mcr.microsoft.com/oss/v2/kubernetes/pause:3.10 --kube-apiserver-arg=max-requests-inflight=400 --kube-apiserver-arg=max-mutating-requests-inflight=100 --kube-controller-manager-arg=node-monitor-period=1m 
+    {{- else }}
+    curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION="{{ .K8sVersion }}+k3s1" sh -s - server --token=SECRET --tls-san {{ .ExternalIP }} --embedded-registry --cluster-cidr=16.0.0.0/5 --service-cidr=172.20.0.0/16 --datastore-endpoint="{{ .EtcdEndpoint }}"  --kubelet-arg=max-pods=300 --etcd-disable-snapshots --disable=traefik,local-storage,coredns,metrics-server  --enable-pprof  --kube-scheduler-arg=config=/etc/rancher/k3s/scheduler-config.yaml  --pause-image=mcr.microsoft.com/oss/v2/kubernetes/pause:3.10  --kube-apiserver-arg=max-requests-inflight=400  --kube-apiserver-arg=max-mutating-requests-inflight=100 --kube-apiserver-arg=etcd-compaction-interval=0 --kube-controller-manager-arg=kube-api-qps=300 --kube-controller-manager-arg=kube-api-burst=400 --kube-controller-manager-arg=node-monitor-period=1m --kube-controller-manager-arg=node-monitor-grace-period=10m --kube-controller-manager-arg=concurrent-job-syncs=100 
+    {{- end }}
 
     systemctl daemon-reload
-    systemctl enable --now k3s-node-labeler.service
     systemctl enable --now k3s-update-peer.service
 
     # Upload kubeconfig to Key Vault with external IP
@@ -156,6 +146,15 @@ runcmd:
     done
 
     {{- else }}
-    curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION="{{ .K8sVersion }}+k3s1" sh -s - agent --token=SECRET --server https://kubernetes.cluster.internal:6443
+    curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION="{{ .K8sVersion }}+k3s1" sh -s - agent --token=SECRET --server https://kubernetes.cluster.internal:6443 --kubelet-arg=max-pods=300 --pause-image=mcr.microsoft.com/oss/v2/kubernetes/pause:3.10
+    
+    # Wait for k3s to be ready, then label this node as worker
+    while ! kubectl --kubeconfig=/var/lib/rancher/k3s/agent/kubelet.kubeconfig get nodes $(hostname) >/dev/null 2>&1; do
+      echo "Waiting for node to be ready..."
+      sleep 10
+    done
+    
+    # Label this node as a worker
+    kubectl --kubeconfig=/var/lib/rancher/k3s/agent/kubelet.kubeconfig label node $(hostname) node-role.kubernetes.io/worker=worker --overwrite
     sleep 5
     {{- end }}

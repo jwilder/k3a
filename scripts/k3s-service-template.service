@@ -1,0 +1,95 @@
+# K3s Service Configuration Template
+# Optimized for 64-core systems with CPU pinning and memory limits
+# 
+# Save this as: /etc/systemd/system/k3s.service
+# 
+# Adjust the following based on your environment:
+# 1. CPUAffinity: Change core range based on your system
+# 2. MemoryHigh/MemoryMax: Adjust based on available RAM
+# 3. ExecStart: Update with your specific K3s configuration
+
+[Unit]
+Description=Lightweight Kubernetes
+Documentation=https://k3s.io
+Wants=network-online.target
+After=network-online.target
+
+[Install]
+WantedBy=multi-user.target
+
+[Service]
+Type=notify
+EnvironmentFile=-/etc/default/%N
+EnvironmentFile=-/etc/sysconfig/%N
+EnvironmentFile=-/etc/systemd/system/k3s.service.env
+KillMode=process
+Delegate=yes
+User=root
+
+# File and process limits
+LimitNOFILE=1048576
+LimitNPROC=infinity
+LimitCORE=infinity
+
+# CPU Optimization Settings
+# Pin k3s to cores 0-47 (first 48 cores), leaving 16 cores for system/OS
+# Adjust this range based on your system:
+# - 64-core: 0-47 (leaving 48-63 for system)
+# - 32-core: 0-23 (leaving 24-31 for system) 
+# - 16-core: 0-11 (leaving 12-15 for system)
+CPUAffinity=0-47
+
+# High priority for k3s (lower nice value = higher priority)
+Nice=-10
+
+# Real-time I/O scheduling
+IOSchedulingClass=1
+IOSchedulingPriority=4
+
+# Memory optimization
+# Adjust based on your system memory:
+# - 256GB+ system: MemoryHigh=200G MemoryMax=220G
+# - 128GB system: MemoryHigh=100G MemoryMax=110G
+# - 64GB system: MemoryHigh=48G MemoryMax=56G
+MemoryHigh=200G
+MemoryMax=220G
+
+TasksMax=infinity
+TimeoutStartSec=0
+Restart=always
+RestartSec=5s
+
+ExecStartPre=/bin/sh -xc '! /usr/bin/systemctl is-enabled --quiet nm-cloud-setup.service 2>/dev/null'
+ExecStartPre=-/sbin/modprobe br_netfilter
+ExecStartPre=-/sbin/modprobe overlay
+
+# K3s server configuration - UPDATE THIS SECTION FOR YOUR ENVIRONMENT
+ExecStart=/usr/local/bin/k3s \
+    server \
+	'--token=YOUR_TOKEN_HERE' \
+	'--tls-san' \
+	'YOUR_SERVER_IP_HERE' \
+	'--embedded-registry' \
+	'--cluster-cidr=16.0.0.0/5' \
+	'--service-cidr=172.20.0.0/16' \
+	'--kube-controller-manager-arg=node-cidr-mask-size=22' \
+	'--kubelet-arg=max-pods=1000' \
+	'--datastore-endpoint=postgres://USERNAME:PASSWORD@HOST:5432/DATABASE' \
+
+# Alternative configurations for different setups:
+#
+# Single node setup:
+# ExecStart=/usr/local/bin/k3s server --cluster-init
+#
+# Cluster with embedded etcd:
+# ExecStart=/usr/local/bin/k3s server --cluster-init --token=SECRET
+#
+# Cluster with external database:
+# ExecStart=/usr/local/bin/k3s server --datastore-endpoint="postgres://user:pass@host:5432/k3s"
+#
+# With TLS certificates:
+# ExecStart=/usr/local/bin/k3s server \
+#     --datastore-endpoint="postgres://user:pass@host:5432/k3s" \
+#     --datastore-cafile="/path/to/ca.pem" \
+#     --datastore-certfile="/path/to/cert.pem" \
+#     --datastore-keyfile="/path/to/key.pem"

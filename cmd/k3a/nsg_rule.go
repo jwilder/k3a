@@ -4,8 +4,8 @@ import (
 	"errors"
 	"os"
 
-	"github.com/jwilder/k3a/nsg/rules"
-	"github.com/jwilder/k3a/pkg/spinner"
+	"github.com/vpatelsj/k3a/nsg/rules"
+	"github.com/vpatelsj/k3a/pkg/spinner"
 	"github.com/spf13/cobra"
 )
 

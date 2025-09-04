@@ -3,8 +3,8 @@ package main
 import (
 	"fmt"
 
-	"github.com/jwilder/k3a/pool"
-	"github.com/jwilder/k3a/pkg/spinner"
+	"github.com/vpatelsj/k3a/pool"
+	"github.com/vpatelsj/k3a/pkg/spinner"
 	"github.com/spf13/cobra"
 )
 

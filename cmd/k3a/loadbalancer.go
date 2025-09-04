@@ -4,10 +4,10 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/jwilder/k3a/loadbalancer"
-	"github.com/jwilder/k3a/loadbalancer/rule"
-	"github.com/jwilder/k3a/pkg/spinner"
-	kstrings "github.com/jwilder/k3a/pkg/strings"
+	"github.com/vpatelsj/k3a/loadbalancer"
+	"github.com/vpatelsj/k3a/loadbalancer/rule"
+	"github.com/vpatelsj/k3a/pkg/spinner"
+	kstrings "github.com/vpatelsj/k3a/pkg/strings"
 	"github.com/spf13/cobra"
 )
 

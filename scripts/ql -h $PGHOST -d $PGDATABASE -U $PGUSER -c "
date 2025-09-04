@@ -1,0 +1,14 @@
+ schemaname | tablename |            indexname            |                                                                                            indexdef                                                                                            
+------------+-----------+---------------------------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ public     | kine      | idx_kine_created_deleted        | CREATE INDEX idx_kine_created_deleted ON public.kine USING btree (created DESC, deleted)
+ public     | kine      | idx_kine_deleted_name_id        | CREATE INDEX idx_kine_deleted_name_id ON public.kine USING btree (deleted, name, id DESC) WHERE (deleted = 0)
+ public     | kine      | idx_kine_hollow_lease_optimized | CREATE INDEX idx_kine_hollow_lease_optimized ON public.kine USING btree (name text_pattern_ops, id DESC) WHERE ((name ~~ '/registry/leases/kube-node-lease/hollow-%'::text) AND (deleted = 0))
+ public     | kine      | idx_kine_id_desc                | CREATE INDEX idx_kine_id_desc ON public.kine USING btree (id DESC)
+ public     | kine      | idx_kine_lease_operations       | CREATE INDEX idx_kine_lease_operations ON public.kine USING btree (name, deleted, id DESC) WHERE (name ~~ '/registry/leases/%'::text)
+ public     | kine      | idx_kine_name_id_desc_composite | CREATE INDEX idx_kine_name_id_desc_composite ON public.kine USING btree (name text_pattern_ops, id DESC)
+ public     | kine      | idx_kine_name_prev_revision     | CREATE INDEX idx_kine_name_prev_revision ON public.kine USING btree (name, prev_revision DESC)
+ public     | kine      | idx_kine_nodes_optimized        | CREATE INDEX idx_kine_nodes_optimized ON public.kine USING btree (name text_pattern_ops, id DESC) WHERE (name ~~ '/registry/nodes/%'::text)
+ public     | kine      | idx_kine_registry_pattern       | CREATE INDEX idx_kine_registry_pattern ON public.kine USING btree (name text_pattern_ops) WHERE (name ~~ '/registry%'::text)
+ public     | kine      | idx_kine_revision_cleanup       | CREATE INDEX idx_kine_revision_cleanup ON public.kine USING btree (create_revision, prev_revision, deleted)
+(10 rows)
+
