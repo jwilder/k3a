@@ -1,4 +1,4 @@
-module github.com/vpatelsj/k3a
+module github.com/jwilder/k3a
 
 go 1.24
 
@@ -18,6 +18,7 @@ require (
 	github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/storage/armstorage v1.8.0
 	github.com/Azure/azure-sdk-for-go/sdk/security/keyvault/azsecrets v1.3.1
 	github.com/OneOfOne/xxhash v1.2.8
+	github.com/davecgh/go-spew v1.1.1
 	github.com/rodaine/table v1.3.0
 	github.com/spf13/cobra v1.9.1
 )
