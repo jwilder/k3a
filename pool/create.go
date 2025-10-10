@@ -233,7 +233,7 @@ func Create(args CreatePoolArgs) error {
 		return err
 	}
 
-	clusterHash := kstrings.UniqueString(cluster)
+	clusterHash := kstrings.UniqueString(cluster, subscriptionID)
 
 	publicIPName := fmt.Sprintf("k3alb%s-publicip", clusterHash)
 	externalIP, err := getPublicIP(ctx, subscriptionID, cluster, publicIPName, cred)

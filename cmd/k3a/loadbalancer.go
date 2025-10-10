@@ -52,7 +52,7 @@ var ruleCreateCmd = &cobra.Command{
 
 		lbName, _ := cmd.Flags().GetString("lb-name")
 		if lbName == "" {
-			lbName = fmt.Sprintf("k3alb%s", kstrings.UniqueString(cluster)) // Default LB name based on cluster
+			lbName = fmt.Sprintf("k3alb%s", kstrings.UniqueString(cluster, subscriptionID)) // Default LB name based on cluster
 		}
 		lbRuleName, _ := cmd.Flags().GetString("rule-name")
 		lbFrontendPort, _ := cmd.Flags().GetInt("frontend-port")
@@ -91,7 +91,7 @@ var ruleListCmd = &cobra.Command{
 
 		lbName, _ := cmd.Flags().GetString("lb-name")
 		if lbName == "" {
-			lbName = fmt.Sprintf("k3alb%s", kstrings.UniqueString(cluster)) // Default LB name based on cluster
+			lbName = fmt.Sprintf("k3alb%s", kstrings.UniqueString(cluster, subscriptionID)) // Default LB name based on cluster
 		}
 		return rule.List(rule.ListRuleArgs{
 			SubscriptionID: subscriptionID,
@@ -116,7 +116,7 @@ var ruleDeleteCmd = &cobra.Command{
 
 		lbName, _ := cmd.Flags().GetString("lb-name")
 		if lbName == "" {
-			lbName = fmt.Sprintf("k3alb%s", kstrings.UniqueString(cluster)) // Default LB name based on cluster
+			lbName = fmt.Sprintf("k3alb%s", kstrings.UniqueString(cluster, subscriptionID)) // Default LB name based on cluster
 		}
 		lbRuleName, _ := cmd.Flags().GetString("rule-name")
 

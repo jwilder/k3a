@@ -48,7 +48,7 @@ func Delete(args DeletePoolArgs) error {
 	}
 
 	// Compute clusterHash for consistent LB naming
-	clusterHash := kstrings.UniqueString(cluster)
+	clusterHash := kstrings.UniqueString(cluster, subscriptionID)
 	// Delete the backend pool from the load balancer
 	lbName := strings.ToLower("k3alb" + clusterHash)
 	backendPoolName := fmt.Sprintf("k3a-%s-backend-pool", poolName)

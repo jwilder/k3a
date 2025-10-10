@@ -23,7 +23,7 @@ var kubeconfigCmd = &cobra.Command{
 			return fmt.Errorf("--cluster flag is required")
 		}
 		// Compute keyvault name from cluster name
-		clusterHash := kstrings.UniqueString(kubeconfigCluster)
+		clusterHash := kstrings.UniqueString(kubeconfigCluster, subscriptionID)
 		kubeconfigKeyVault := fmt.Sprintf("k3akv%s", clusterHash)
 		ctx := context.Background()
 		cred, err := azidentity.NewDefaultAzureCredential(nil)
