@@ -154,6 +154,9 @@ func classifyAzureRoleAssignmentError(err error) bool { // # noqa: E501
 		if sc == 404 || sc == 409 || sc == 429 || (sc >= 500 && sc < 600) {
 			return true
 		}
+		if respErr.ErrorCode == "PrincipalNotFound" {
+			return true
+		}
 		return false
 	}
 	// Unknown error type: be conservative and retry once
