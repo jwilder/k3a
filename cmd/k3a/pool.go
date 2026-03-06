@@ -232,7 +232,7 @@ func init() {
 	createPoolCmd.Flags().Int("instance-count", 1, "Number of VMSS instances")
 	createPoolCmd.Flags().String("ssh-key", os.ExpandEnv("$HOME/.ssh/id_rsa.pub"), "Path to the SSH public key file")
 	createPoolCmd.Flags().String("k8s-version", "v1.35.2", "Kubernetes version (e.g. v1.35.2)")
-	createPoolCmd.Flags().String("sku", "Standard_D96s_v5", "VM SKU type (default: Standard_D96s_v5)")
+	createPoolCmd.Flags().String("sku", "Standard_D32s_v3", "VM SKU type (default: Standard_D32s_v3)")
 	createPoolCmd.Flags().Int("os-disk-size", 30, "OS disk size in GB (default: 30)")
 	createPoolCmd.Flags().StringArray("msi", nil, "Additional user-assigned MSI resource IDs to add to the VMSS (can be specified multiple times)")
 	createPoolCmd.Flags().StringArray("etcd-endpoints", nil, "External etcd endpoints (e.g. --etcd-endpoints http://10.0.0.1:2379). Can be specified multiple times.")
