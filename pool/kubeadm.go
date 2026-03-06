@@ -24,6 +24,13 @@ type KubeadmInstaller struct {
 	credential     *azidentity.DefaultAzureCredential
 	etcdEndpoints  []string // External etcd endpoints (e.g. http://10.0.0.1:2379)
 	k8sVersion     string   // Kubernetes version (e.g. v1.35.2)
+
+	// Control plane tuning (0 means use default)
+	maxRequestsInflight         int
+	maxMutatingRequestsInflight int
+	maxPods                     int
+	controllerManagerQPS        int
+	controllerManagerBurst      int
 }
 
 // NewKubeadmInstaller creates a new kubeadm installer
@@ -604,6 +611,28 @@ func (k *KubeadmInstaller) InstallAsFirstMaster(ctx context.Context) error {
 		}
 	}
 
+	// Apply defaults for tuning parameters
+	maxRequestsInflight := k.maxRequestsInflight
+	if maxRequestsInflight == 0 {
+		maxRequestsInflight = 400
+	}
+	maxMutatingRequestsInflight := k.maxMutatingRequestsInflight
+	if maxMutatingRequestsInflight == 0 {
+		maxMutatingRequestsInflight = 100
+	}
+	maxPods := k.maxPods
+	if maxPods == 0 {
+		maxPods = 300
+	}
+	controllerManagerQPS := k.controllerManagerQPS
+	if controllerManagerQPS == 0 {
+		controllerManagerQPS = 300
+	}
+	controllerManagerBurst := k.controllerManagerBurst
+	if controllerManagerBurst == 0 {
+		controllerManagerBurst = 400
+	}
+
 	kubeadmConfig := fmt.Sprintf(`apiVersion: kubeadm.k8s.io/v1beta4
 kind: ClusterConfiguration
 kubernetesVersion: %s
@@ -617,9 +646,9 @@ apiServer:
   - "%s"
   extraArgs:
   - name: max-requests-inflight
-    value: "400"
+    value: "%d"
   - name: max-mutating-requests-inflight
-    value: "100"
+    value: "%d"
   - name: etcd-compaction-interval
     value: "0"
 controllerManager:
@@ -631,9 +660,9 @@ controllerManager:
   - name: service-cluster-ip-range
     value: "172.20.0.0/16"
   - name: kube-api-qps
-    value: "300"
+    value: "%d"
   - name: kube-api-burst
-    value: "400"
+    value: "%d"
   - name: node-monitor-period
     value: "1m"
   - name: node-monitor-grace-period
@@ -649,7 +678,7 @@ localAPIEndpoint:
 ---
 apiVersion: kubelet.config.k8s.io/v1beta1
 kind: KubeletConfiguration
-maxPods: 300
+maxPods: %d
 failCgroupV1: false
 ---
 apiVersion: kubescheduler.config.k8s.io/v1beta3
@@ -661,7 +690,7 @@ clientConnection:
 percentageOfNodesToScore: 1
 profiles:
   - schedulerName: default-scheduler
-`, k.k8sVersion, controlPlaneEndpoint, internalIP, dnsName, etcdSection, internalIP)
+`, k.k8sVersion, controlPlaneEndpoint, internalIP, dnsName, maxRequestsInflight, maxMutatingRequestsInflight, controllerManagerQPS, controllerManagerBurst, etcdSection, internalIP, maxPods)
 
 	// Write kubeadm config to temporary file
 	configCmd := fmt.Sprintf("cat > /tmp/kubeadm-config.yaml << 'EOF'\n%s\nEOF", kubeadmConfig)

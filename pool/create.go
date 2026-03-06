@@ -36,6 +36,13 @@ type CreatePoolArgs struct {
 	EtcdResourceGroup string   // Resource group of the external etcd cluster (for NSG rule automation)
 	EtcdSubscription  string   // Subscription of the external etcd cluster (defaults to pool subscription)
 	EtcdPort          int      // Port for etcd endpoints when auto-discovered (default: 2379)
+
+	// Control plane tuning
+	MaxRequestsInflight         int // API server --max-requests-inflight (default: 400)
+	MaxMutatingRequestsInflight int // API server --max-mutating-requests-inflight (default: 100)
+	MaxPods                     int // Kubelet maxPods (default: 300)
+	ControllerManagerQPS        int // Controller manager --kube-api-qps (default: 300)
+	ControllerManagerBurst      int // Controller manager --kube-api-burst (default: 400)
 }
 
 //go:embed cloud-init.yaml
@@ -234,8 +241,17 @@ func determineNodeType(ctx context.Context, role string, subscriptionID, cluster
 	return "first-master", nil
 }
 
+// ScaleTuning holds control plane tuning parameters
+type ScaleTuning struct {
+	MaxRequestsInflight         int
+	MaxMutatingRequestsInflight int
+	MaxPods                     int
+	ControllerManagerQPS        int
+	ControllerManagerBurst      int
+}
+
 // installKubeadmOnInstances installs kubeadm on all instances in a VMSS
-func installKubeadmOnInstances(ctx context.Context, subscriptionID, cluster, vmssName, role, location string, expectedCount int, etcdEndpoints []string, k8sVersion string, cred *azidentity.DefaultAzureCredential) error {
+func installKubeadmOnInstances(ctx context.Context, subscriptionID, cluster, vmssName, role, location string, expectedCount int, etcdEndpoints []string, k8sVersion string, tuning ScaleTuning, cred *azidentity.DefaultAzureCredential) error {
 	fmt.Printf("Installing kubeadm on VMSS: %s (role: %s)\n", vmssName, role)
 
 	// Create VMSS manager to get instance information
@@ -308,6 +324,11 @@ func installKubeadmOnInstances(ctx context.Context, subscriptionID, cluster, vms
 		installer.etcdEndpoints = etcdEndpoints
 		installer.k8sVersion = k8sVersion
 		installer.region = location
+		installer.maxRequestsInflight = tuning.MaxRequestsInflight
+		installer.maxMutatingRequestsInflight = tuning.MaxMutatingRequestsInflight
+		installer.maxPods = tuning.MaxPods
+		installer.controllerManagerQPS = tuning.ControllerManagerQPS
+		installer.controllerManagerBurst = tuning.ControllerManagerBurst
 
 		// Install based on node type
 		switch nodeType {
@@ -359,6 +380,11 @@ func installKubeadmOnInstances(ctx context.Context, subscriptionID, cluster, vms
 			installer.etcdEndpoints = etcdEndpoints
 			installer.k8sVersion = k8sVersion
 			installer.region = location
+			installer.maxRequestsInflight = tuning.MaxRequestsInflight
+			installer.maxMutatingRequestsInflight = tuning.MaxMutatingRequestsInflight
+			installer.maxPods = tuning.MaxPods
+			installer.controllerManagerQPS = tuning.ControllerManagerQPS
+			installer.controllerManagerBurst = tuning.ControllerManagerBurst
 
 			if err := installer.InstallAsAdditionalMaster(ctx); err != nil {
 				return fmt.Errorf("failed to install additional master on %s: %w", instance.Name, err)
@@ -703,7 +729,13 @@ func Create(args CreatePoolArgs) error {
 	}
 
 	// Install kubeadm on the newly created instances
-	if err := installKubeadmOnInstances(ctx, subscriptionID, cluster, args.Name+"-vmss", args.Role, args.Location, args.InstanceCount, args.EtcdEndpoints, args.K8sVersion, cred); err != nil {
+	if err := installKubeadmOnInstances(ctx, subscriptionID, cluster, args.Name+"-vmss", args.Role, args.Location, args.InstanceCount, args.EtcdEndpoints, args.K8sVersion, ScaleTuning{
+		MaxRequestsInflight:         args.MaxRequestsInflight,
+		MaxMutatingRequestsInflight: args.MaxMutatingRequestsInflight,
+		MaxPods:                     args.MaxPods,
+		ControllerManagerQPS:        args.ControllerManagerQPS,
+		ControllerManagerBurst:      args.ControllerManagerBurst,
+	}, cred); err != nil {
 		return fmt.Errorf("kubeadm installation failed: %w", err)
 	}
 

@@ -66,26 +66,38 @@ var createPoolCmd = &cobra.Command{
 		etcdSubscription, _ := cmd.Flags().GetString("etcd-subscription")
 		etcdPort, _ := cmd.Flags().GetInt("etcd-port")
 
+		// Control plane tuning flags
+		maxRequestsInflight, _ := cmd.Flags().GetInt("max-requests-inflight")
+		maxMutatingRequestsInflight, _ := cmd.Flags().GetInt("max-mutating-requests-inflight")
+		maxPods, _ := cmd.Flags().GetInt("max-pods")
+		controllerManagerQPS, _ := cmd.Flags().GetInt("controller-manager-qps")
+		controllerManagerBurst, _ := cmd.Flags().GetInt("controller-manager-burst")
+
 		// Add spinner for pool creation
 		stopSpinner := spinner.Spinner("Creating VMSS pool...")
 		defer stopSpinner()
 
 		return pool.Create(pool.CreatePoolArgs{
-			SubscriptionID:    subscriptionID,
-			Cluster:           cluster,
-			Location:          location,
-			Role:              role,
-			Name:              name,
-			SSHKeyPath:        sshKeyPath,
-			InstanceCount:     instanceCount,
-			K8sVersion:        k8sVersion,
-			SKU:               sku,
-			OSDiskSizeGB:      osDiskSize,
-			MSIIDs:            msiIDs,
-			EtcdEndpoints:     etcdEndpoints,
-			EtcdResourceGroup: etcdRG,
-			EtcdSubscription:  etcdSubscription,
-			EtcdPort:          etcdPort,
+			SubscriptionID:              subscriptionID,
+			Cluster:                     cluster,
+			Location:                    location,
+			Role:                        role,
+			Name:                        name,
+			SSHKeyPath:                  sshKeyPath,
+			InstanceCount:               instanceCount,
+			K8sVersion:                  k8sVersion,
+			SKU:                         sku,
+			OSDiskSizeGB:                osDiskSize,
+			MSIIDs:                      msiIDs,
+			EtcdEndpoints:               etcdEndpoints,
+			EtcdResourceGroup:           etcdRG,
+			EtcdSubscription:            etcdSubscription,
+			EtcdPort:                    etcdPort,
+			MaxRequestsInflight:         maxRequestsInflight,
+			MaxMutatingRequestsInflight: maxMutatingRequestsInflight,
+			MaxPods:                     maxPods,
+			ControllerManagerQPS:        controllerManagerQPS,
+			ControllerManagerBurst:      controllerManagerBurst,
 		})
 	},
 }
@@ -180,14 +192,26 @@ var kubeadmInstallCmd = &cobra.Command{
 		etcdEndpoints, _ := cmd.Flags().GetStringArray("etcd-endpoints")
 		region, _ := cmd.Flags().GetString("region")
 
+		// Control plane tuning flags
+		maxRequestsInflight, _ := cmd.Flags().GetInt("max-requests-inflight")
+		maxMutatingRequestsInflight, _ := cmd.Flags().GetInt("max-mutating-requests-inflight")
+		maxPods, _ := cmd.Flags().GetInt("max-pods")
+		controllerManagerQPS, _ := cmd.Flags().GetInt("controller-manager-qps")
+		controllerManagerBurst, _ := cmd.Flags().GetInt("controller-manager-burst")
+
 		return pool.KubeadmInstall(pool.KubeadmInstallArgs{
-			SubscriptionID: subscriptionID,
-			Cluster:        cluster,
-			Name:           name,
-			Role:           role,
-			Location:       region,
-			K8sVersion:     k8sVersion,
-			EtcdEndpoints:  etcdEndpoints,
+			SubscriptionID:              subscriptionID,
+			Cluster:                     cluster,
+			Name:                        name,
+			Role:                        role,
+			Location:                    region,
+			K8sVersion:                  k8sVersion,
+			EtcdEndpoints:               etcdEndpoints,
+			MaxRequestsInflight:         maxRequestsInflight,
+			MaxMutatingRequestsInflight: maxMutatingRequestsInflight,
+			MaxPods:                     maxPods,
+			ControllerManagerQPS:        controllerManagerQPS,
+			ControllerManagerBurst:      controllerManagerBurst,
 		})
 	},
 }
@@ -208,13 +232,20 @@ func init() {
 	createPoolCmd.Flags().Int("instance-count", 1, "Number of VMSS instances")
 	createPoolCmd.Flags().String("ssh-key", os.ExpandEnv("$HOME/.ssh/id_rsa.pub"), "Path to the SSH public key file")
 	createPoolCmd.Flags().String("k8s-version", "v1.35.2", "Kubernetes version (e.g. v1.35.2)")
-	createPoolCmd.Flags().String("sku", "Standard_D2s_v3", "VM SKU type (default: Standard_D2s_v3)")
+	createPoolCmd.Flags().String("sku", "Standard_D96s_v5", "VM SKU type (default: Standard_D96s_v5)")
 	createPoolCmd.Flags().Int("os-disk-size", 30, "OS disk size in GB (default: 30)")
 	createPoolCmd.Flags().StringArray("msi", nil, "Additional user-assigned MSI resource IDs to add to the VMSS (can be specified multiple times)")
 	createPoolCmd.Flags().StringArray("etcd-endpoints", nil, "External etcd endpoints (e.g. --etcd-endpoints http://10.0.0.1:2379). Can be specified multiple times.")
 	createPoolCmd.Flags().String("etcd-rg", "", "Resource group of the external etcd cluster (for auto-adding NSG rules)")
 	createPoolCmd.Flags().String("etcd-subscription", "", "Subscription of the external etcd cluster (defaults to pool subscription)")
 	createPoolCmd.Flags().Int("etcd-port", 2379, "Port for auto-discovered etcd endpoints (default: 2379)")
+
+	// Control plane tuning flags
+	createPoolCmd.Flags().Int("max-requests-inflight", 0, "API server --max-requests-inflight (0 = default: 400)")
+	createPoolCmd.Flags().Int("max-mutating-requests-inflight", 0, "API server --max-mutating-requests-inflight (0 = default: 100)")
+	createPoolCmd.Flags().Int("max-pods", 0, "Kubelet maxPods (0 = default: 300)")
+	createPoolCmd.Flags().Int("controller-manager-qps", 0, "Controller manager --kube-api-qps (0 = default: 300)")
+	createPoolCmd.Flags().Int("controller-manager-burst", 0, "Controller manager --kube-api-burst (0 = default: 400)")
 
 	_ = createPoolCmd.MarkFlagRequired("name")
 	_ = createPoolCmd.MarkFlagRequired("role")
@@ -237,6 +268,11 @@ func init() {
 	kubeadmInstallCmd.Flags().String("role", "", "Role of the node pool (control-plane or worker) (required)")
 	kubeadmInstallCmd.Flags().String("k8s-version", "v1.35.2", "Kubernetes version (e.g. v1.35.2)")
 	kubeadmInstallCmd.Flags().StringArray("etcd-endpoints", nil, "External etcd endpoints (e.g. --etcd-endpoints http://10.0.0.1:2379). Can be specified multiple times.")
+	kubeadmInstallCmd.Flags().Int("max-requests-inflight", 0, "API server --max-requests-inflight (0 = default: 400)")
+	kubeadmInstallCmd.Flags().Int("max-mutating-requests-inflight", 0, "API server --max-mutating-requests-inflight (0 = default: 100)")
+	kubeadmInstallCmd.Flags().Int("max-pods", 0, "Kubelet maxPods (0 = default: 300)")
+	kubeadmInstallCmd.Flags().Int("controller-manager-qps", 0, "Controller manager --kube-api-qps (0 = default: 300)")
+	kubeadmInstallCmd.Flags().Int("controller-manager-burst", 0, "Controller manager --kube-api-burst (0 = default: 400)")
 	_ = kubeadmInstallCmd.MarkFlagRequired("name")
 	_ = kubeadmInstallCmd.MarkFlagRequired("role")
 

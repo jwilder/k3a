@@ -16,6 +16,13 @@ type KubeadmInstallArgs struct {
 	Location       string
 	K8sVersion     string
 	EtcdEndpoints  []string
+
+	// Control plane tuning
+	MaxRequestsInflight         int
+	MaxMutatingRequestsInflight int
+	MaxPods                     int
+	ControllerManagerQPS        int
+	ControllerManagerBurst      int
 }
 
 func KubeadmInstall(args KubeadmInstallArgs) error {
@@ -102,6 +109,11 @@ func KubeadmInstall(args KubeadmInstallArgs) error {
 		installer.etcdEndpoints = args.EtcdEndpoints
 		installer.k8sVersion = args.K8sVersion
 		installer.region = args.Location
+		installer.maxRequestsInflight = args.MaxRequestsInflight
+		installer.maxMutatingRequestsInflight = args.MaxMutatingRequestsInflight
+		installer.maxPods = args.MaxPods
+		installer.controllerManagerQPS = args.ControllerManagerQPS
+		installer.controllerManagerBurst = args.ControllerManagerBurst
 
 		// Install based on node type
 		switch nodeType {
@@ -152,6 +164,11 @@ func KubeadmInstall(args KubeadmInstallArgs) error {
 			installer := NewKubeadmInstaller(args.SubscriptionID, args.Cluster, keyVaultName, sshClient, cred)
 			installer.etcdEndpoints = args.EtcdEndpoints
 			installer.region = args.Location
+			installer.maxRequestsInflight = args.MaxRequestsInflight
+			installer.maxMutatingRequestsInflight = args.MaxMutatingRequestsInflight
+			installer.maxPods = args.MaxPods
+			installer.controllerManagerQPS = args.ControllerManagerQPS
+			installer.controllerManagerBurst = args.ControllerManagerBurst
 
 			if err := installer.InstallAsAdditionalMaster(ctx); err != nil {
 				return fmt.Errorf("failed to install additional master on %s: %w", instance.Name, err)
