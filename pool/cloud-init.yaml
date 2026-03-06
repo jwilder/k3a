@@ -2,33 +2,45 @@
 
 # Complete VM setup for k3a cluster nodes
 # Includes all packages needed for Kubernetes/kubeadm installation
+# NOTE: package_update and packages sections are intentionally disabled.
+# All installs happen in runcmd with retry+jitter to avoid 429 rate limits
+# when scaling hundreds of nodes simultaneously against packages.microsoft.com.
 
-package_update: true
-
-packages:
-  - curl
-  - wget
-  - git
-  - unzip
-  - ca-certificates
-  - moby-runc
-  - moby-containerd
+package_update: false
 
 # Complete system setup for Kubernetes
 runcmd:
-  # Install Azure CLI for CBL-Mariner (RPM-based)
-  - sudo rpm --import https://packages.microsoft.com/keys/microsoft.asc
+  # Random jitter (0-120s) to stagger package downloads across nodes
   - |
-    cat <<EOF | sudo tee /etc/yum.repos.d/azure-cli.repo
-    [azure-cli]
-    name=Azure CLI
-    baseurl=https://packages.microsoft.com/yumrepos/azure-cli
-    enabled=1
-    gpgcheck=1
-    gpgkey=https://packages.microsoft.com/keys/microsoft.asc
-    EOF
-  - sudo tdnf install -y azure-cli
-  
+    JITTER=$((RANDOM % 120))
+    echo "Sleeping ${JITTER}s to stagger package installs..."
+    sleep $JITTER
+
+  # Install all packages with retry logic (handles 429 rate limits)
+  - |
+    tdnf_retry() {
+      local max_attempts=10
+      local attempt=1
+      local backoff=15
+      while [ $attempt -le $max_attempts ]; do
+        echo "tdnf attempt $attempt/$max_attempts: $@"
+        if sudo tdnf -y "$@" 2>&1; then
+          return 0
+        fi
+        echo "tdnf failed (attempt $attempt), retrying in ${backoff}s..."
+        sleep $((backoff + RANDOM % 30))
+        backoff=$((backoff * 2))
+        if [ $backoff -gt 1800 ]; then backoff=1800; fi
+        # Clear stale cache before retry
+        sudo tdnf clean all 2>/dev/null || true
+        attempt=$((attempt + 1))
+      done
+      echo "tdnf failed after $max_attempts attempts"
+      return 1
+    }
+    # Install base packages (from Mariner repos)
+    tdnf_retry install curl wget git unzip ca-certificates moby-runc moby-containerd
+
   # Setup container runtime
   - sudo systemctl enable --now containerd
   - sudo mkdir -p /etc/containerd
@@ -56,7 +68,7 @@ runcmd:
   - sudo swapoff -a
   - sudo sed -i '/ swap / s/^\(.*\)$/#\1/g' /etc/fstab
   
-  # Setup Kubernetes repository and install packages
+  # Setup Kubernetes repository and install packages with retry
   - |
     sudo tee /etc/yum.repos.d/kubernetes.repo <<EOF
     [kubernetes]
@@ -66,7 +78,27 @@ runcmd:
     gpgcheck=1
     gpgkey=https://pkgs.k8s.io/core:/stable:/{{.K8sMinorVersion}}/rpm/repodata/repomd.xml.key
     EOF
-  - sudo tdnf install -y kubelet kubeadm kubectl
+  - |
+    tdnf_retry() {
+      local max_attempts=10
+      local attempt=1
+      local backoff=15
+      while [ $attempt -le $max_attempts ]; do
+        echo "tdnf attempt $attempt/$max_attempts: $@"
+        if sudo tdnf -y "$@" 2>&1; then
+          return 0
+        fi
+        echo "tdnf failed (attempt $attempt), retrying in ${backoff}s..."
+        sleep $((backoff + RANDOM % 30))
+        backoff=$((backoff * 2))
+        if [ $backoff -gt 1800 ]; then backoff=1800; fi
+        sudo tdnf clean all 2>/dev/null || true
+        attempt=$((attempt + 1))
+      done
+      echo "tdnf failed after $max_attempts attempts"
+      return 1
+    }
+    tdnf_retry install kubelet kubeadm kubectl
   - sudo systemctl enable kubelet
   
   # Ensure azureuser has proper SSH directory
@@ -114,6 +146,9 @@ runcmd:
       systemctl start k3a-worker-join.service
     fi
 
+  # Mark cloud-init as complete (only after all packages installed successfully)
+  - touch /var/lib/cloud/k3a-ready
+
 write_files:
   # Create worker auto-join script
   - path: /usr/local/bin/k3a-worker-join.sh
@@ -135,26 +170,36 @@ write_files:
 
       log "Starting worker node auto-join process..."
 
-      # Wait for Azure CLI to be available
-      timeout 300 bash -c 'until az --version >/dev/null 2>&1; do sleep 5; done' || {
-          log "Azure CLI not available after timeout"
-          exit 1
-      }
+      # Get managed identity token from IMDS (no Azure CLI needed)
+      KEYVAULT_NAME="{{.KeyVaultName}}"
+      SECRET_NAME="{{.ResourceGroup}}-worker-join"
+      IMDS_URL="http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https%3A%2F%2Fvault.azure.net"
 
-      # Login using managed identity
-      log "Logging in with managed identity..."
-      if ! az login --identity >> "$LOG_FILE" 2>&1; then
-          log "Failed to login with managed identity"
+      log "Acquiring managed identity token from IMDS..."
+      for i in {1..30}; do
+          TOKEN_RESPONSE=$(curl -s -H "Metadata: true" "$IMDS_URL" 2>/dev/null)
+          TOKEN=$(echo "$TOKEN_RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])" 2>/dev/null)
+          if [ -n "$TOKEN" ]; then
+              log "Acquired managed identity token"
+              break
+          fi
+          log "Attempt $i: Waiting for IMDS token..."
+          sleep 10
+      done
+
+      if [ -z "$TOKEN" ]; then
+          log "Failed to acquire managed identity token after 5 minutes"
           exit 1
       fi
 
-      # Wait for worker join token to be available in Key Vault
-      KEYVAULT_NAME="{{.KeyVaultName}}"
-      SECRET_NAME="{{.ResourceGroup}}-worker-join"
+      # Fetch worker join token from Key Vault REST API
+      KV_URL="https://${KEYVAULT_NAME}.vault.azure.net/secrets/${SECRET_NAME}?api-version=7.4"
 
       log "Waiting for worker join token from Key Vault: $KEYVAULT_NAME"
       for i in {1..60}; do
-          if JOIN_COMMAND=$(az keyvault secret show --vault-name "$KEYVAULT_NAME" --name "$SECRET_NAME" --query "value" --output tsv 2>/dev/null); then
+          KV_RESPONSE=$(curl -s -H "Authorization: Bearer $TOKEN" "$KV_URL" 2>/dev/null)
+          JOIN_COMMAND=$(echo "$KV_RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin)['value'])" 2>/dev/null)
+          if [ -n "$JOIN_COMMAND" ]; then
               log "Retrieved worker join command"
               break
           fi
@@ -203,14 +248,6 @@ write_files:
       WantedBy=multi-user.target
     permissions: '0644'
     owner: root:root
-
-  # Create a marker file to indicate cloud-init completion
-  - path: /var/lib/cloud/k3a-ready
-    content: |
-      Cloud-init setup completed for k3a cluster node
-      All Kubernetes prerequisites installed
-      Timestamp: $(date)
-    permissions: '0644'
 
 # Ensure services are enabled
 bootcmd:
