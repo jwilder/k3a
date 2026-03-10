@@ -119,10 +119,11 @@ func (k *KubeadmInstaller) storeSecretInKeyVault(ctx context.Context, secretName
 
 // purgeDeletedSecret attempts to purge a soft-deleted secret
 func (k *KubeadmInstaller) purgeDeletedSecret(ctx context.Context, secretName string) error {
-	// Use the REST API directly for purging since the SDK might not have this operation
-	// This requires the Key Vault Contributor role or Key Vault Administrator role
-	cmd := fmt.Sprintf("az keyvault secret purge --vault-name %s --name %s", k.keyVaultName, secretName)
-	_, err := k.executeCommand(cmd)
+	client, err := azsecrets.NewClient(fmt.Sprintf("https://%s.vault.azure.net/", k.keyVaultName), k.credential, nil)
+	if err != nil {
+		return fmt.Errorf("failed to create Key Vault client: %w", err)
+	}
+	_, err = client.PurgeDeletedSecret(ctx, secretName, nil)
 	return err
 }
 
@@ -380,33 +381,6 @@ func (k *KubeadmInstaller) installKubeadmPrerequisites() error {
 	return nil
 }
 
-// waitForAzureCLI waits for Azure CLI to become available
-func (k *KubeadmInstaller) waitForAzureCLI() error {
-	fmt.Println("Waiting for Azure CLI to become available...")
-
-	for i := 0; i < 60; i++ { // Wait up to 5 minutes
-		_, err := k.executeCommand("which az")
-		if err == nil {
-			fmt.Println("Azure CLI is now available")
-			return nil
-		}
-
-		// Also try the full path
-		_, err = k.executeCommand("test -x /usr/bin/az")
-		if err == nil {
-			fmt.Println("Azure CLI found at /usr/bin/az")
-			return nil
-		}
-
-		if i < 59 {
-			fmt.Printf("Azure CLI not yet available, waiting... (%d/60)\n", i+1)
-			time.Sleep(5 * time.Second)
-		}
-	}
-
-	return fmt.Errorf("azure CLI did not become available within timeout")
-}
-
 // waitForKubeadm waits for kubeadm to become available
 func (k *KubeadmInstaller) waitForKubeadm() error {
 	fmt.Println("Waiting for kubeadm to become available...")
@@ -489,25 +463,6 @@ func (k *KubeadmInstaller) setupDNSResolution() error {
 	return nil
 }
 
-// loginToAzure logs in to Azure using managed identity
-func (k *KubeadmInstaller) loginToAzure() error {
-	fmt.Println("Logging in to Azure using managed identity...")
-
-	// Wait for Azure CLI to be available first
-	if err := k.waitForAzureCLI(); err != nil {
-		return fmt.Errorf("azure CLI not available: %w", err)
-	}
-
-	// Use full path to az command and set PATH to ensure it's found
-	_, err := k.executeCommand("export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin && /usr/bin/az login --identity")
-	if err != nil {
-		return fmt.Errorf("failed to login to Azure: %w", err)
-	}
-
-	fmt.Println("Successfully logged in to Azure")
-	return nil
-}
-
 // getSecretFromKeyVault retrieves a secret from Key Vault
 func (k *KubeadmInstaller) getSecretFromKeyVault(ctx context.Context, secretName string) (string, error) {
 	client, err := azsecrets.NewClient(fmt.Sprintf("https://%s.vault.azure.net/", k.keyVaultName), k.credential, nil)
@@ -564,11 +519,6 @@ func (k *KubeadmInstaller) InstallAsFirstMaster(ctx context.Context) error {
 		}
 	} else {
 		fmt.Println("Node is already bootstrapped, skipping prerequisite installation")
-	}
-
-	// Login to Azure
-	if err := k.loginToAzure(); err != nil {
-		return err
 	}
 
 	// Clean up any existing stale tokens before bootstrapping
@@ -675,6 +625,8 @@ kind: InitConfiguration
 localAPIEndpoint:
   advertiseAddress: "%s"
   bindPort: 6443
+timeouts:
+  controlPlaneComponentHealthCheck: 10m0s
 ---
 apiVersion: kubelet.config.k8s.io/v1beta1
 kind: KubeletConfiguration
@@ -1135,11 +1087,6 @@ func (k *KubeadmInstaller) InstallAsAdditionalMaster(ctx context.Context) error 
 		fmt.Println("Node is already bootstrapped, skipping prerequisite installation")
 	}
 
-	// Login to Azure
-	if err := k.loginToAzure(); err != nil {
-		return err
-	}
-
 	// Setup DNS resolution for cluster endpoint (needed for kubeadm-config ConfigMap access)
 	if err := k.setupDNSResolution(); err != nil {
 		return fmt.Errorf("failed to setup DNS resolution: %w", err)
@@ -1212,11 +1159,6 @@ func (k *KubeadmInstaller) InstallAsWorker(ctx context.Context) error {
 		}
 	} else {
 		fmt.Println("Node is already bootstrapped, skipping prerequisite installation")
-	}
-
-	// Login to Azure
-	if err := k.loginToAzure(); err != nil {
-		return err
 	}
 
 	// Wait for worker join token to be available

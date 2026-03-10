@@ -9,8 +9,16 @@ set -euo pipefail
 # ─── Configuration ───────────────────────────────────────────────────────────
 SUBSCRIPTION="110efc33-11a4-46b9-9986-60716283fbe7"
 REGION="canadacentral"
-CLUSTER_PREFIX="k3a-canadacentral"
-RUN_ID="6"  # bump this for a fresh deployment
+CLUSTER_PREFIX="k3a-canadacentral-vapa-200k"
+
+# Auto-increment RUN_ID using a state file
+RUN_ID_FILE="${HOME}/.k3a-deploy-run-id"
+if [[ -f "$RUN_ID_FILE" ]]; then
+  RUN_ID=$(( $(cat "$RUN_ID_FILE") + 1 ))
+else
+  RUN_ID=1
+fi
+echo "$RUN_ID" > "$RUN_ID_FILE"
 
 # Single resource group for everything
 RG_NAME="${CLUSTER_PREFIX}-${RUN_ID}"
@@ -19,7 +27,6 @@ K3A_CLUSTER="${RG_NAME}"
 # Paths (adjust if your repos are elsewhere)
 DOVETAIL_DIR="$HOME/dev/dovetail"
 K3A_DIR="$HOME/k3a"
-KUBE_INFLATER_DIR="$HOME/dev/kube-inflater"
 
 # Control plane tuning for 100K hollow nodes
 MAX_REQUESTS_INFLIGHT=3000
@@ -31,11 +38,9 @@ CONTROLLER_MANAGER_BURST=600
 # Pool sizing
 CP_INSTANCE_COUNT=1
 CP_SKU="Standard_D96s_v5"
-WORKER_INSTANCE_COUNT=10
-WORKER_SKU="Standard_D32s_v5"
-
-# kube-inflater settings
-CONTAINERS_PER_POD=100
+WORKER_POOL_COUNT=10
+WORKER_INSTANCE_COUNT=90
+WORKER_SKU="Standard_D16s_v3"
 
 # ─── Colors ──────────────────────────────────────────────────────────────────
 RED='\033[0;31m'
@@ -57,13 +62,12 @@ command -v kubectl >/dev/null || fail "kubectl not found"
 command -v go      >/dev/null || fail "go not found"
 [[ -d "$DOVETAIL_DIR" ]]       || fail "Dovetail repo not found at $DOVETAIL_DIR"
 [[ -d "$K3A_DIR" ]]            || fail "k3a repo not found at $K3A_DIR"
-[[ -d "$KUBE_INFLATER_DIR" ]]  || fail "kube-inflater repo not found at $KUBE_INFLATER_DIR"
 
 log "Subscription:  $SUBSCRIPTION"
 log "Region:        $REGION"
 log "Resource Group: $RG_NAME"
 log "CP SKU:        $CP_SKU (x${CP_INSTANCE_COUNT})"
-log "Worker SKU:    $WORKER_SKU (x${WORKER_INSTANCE_COUNT})"
+log "Worker SKU:    $WORKER_SKU (${WORKER_POOL_COUNT} pools x ${WORKER_INSTANCE_COUNT})"
 log ""
 if [[ "${AUTO_APPROVE:-}" != "1" ]]; then
   read -rp "Proceed? [y/N] " ans </dev/tty
@@ -82,6 +86,10 @@ banner "Step 1: Deploy Dovetail"
   --resource-group "$RG_NAME" \
   --cluster-name "$RG_NAME" \
   --location "$REGION" \
+  --vm-size "Standard_D96s_v5" \
+  --postgres-sku "Standard_D96ads_v5" \
+  --postgres-tier "P40" \
+  --postgres-storage 2048 \
   --yes
 
 # Extract the Dovetail VM public IP
@@ -195,26 +203,43 @@ kubectl get nodes
 # ═══════════════════════════════════════════════════════════════════════════════
 # STEP 5: Create worker pool
 # ═══════════════════════════════════════════════════════════════════════════════
-banner "Step 5: Create worker pool"
+banner "Step 5: Create worker pools"
 
-./k3a pool create \
-  --subscription "$SUBSCRIPTION" \
-  --cluster "$K3A_CLUSTER" \
-  --region "$REGION" \
-  --role worker \
-  --name agent \
-  --ssh-key ~/.ssh/id_rsa.pub \
-  --instance-count "$WORKER_INSTANCE_COUNT" \
-  --sku "$WORKER_SKU"
+TOTAL_WORKERS=$((WORKER_POOL_COUNT * WORKER_INSTANCE_COUNT))
+POOL_PIDS=()
+for idx in $(seq 1 "$WORKER_POOL_COUNT"); do
+  POOL_NAME="agent${idx}"
+  log "Launching worker pool ${POOL_NAME} (${idx}/${WORKER_POOL_COUNT})..."
+  ./k3a pool create \
+    --subscription "$SUBSCRIPTION" \
+    --cluster "$K3A_CLUSTER" \
+    --region "$REGION" \
+    --role worker \
+    --name "$POOL_NAME" \
+    --ssh-key ~/.ssh/id_rsa.pub \
+    --instance-count "$WORKER_INSTANCE_COUNT" \
+    --sku "$WORKER_SKU" &
+  POOL_PIDS+=($!)
+done
 
-log "Waiting for worker nodes to register..."
-for i in $(seq 1 60); do
+log "Waiting for all ${WORKER_POOL_COUNT} pool creation jobs to finish..."
+POOL_FAILURES=0
+for pid in "${POOL_PIDS[@]}"; do
+  if ! wait "$pid"; then
+    ((POOL_FAILURES++))
+  fi
+done
+[[ "$POOL_FAILURES" -gt 0 ]] && fail "${POOL_FAILURES} pool creation(s) failed"
+log "All ${WORKER_POOL_COUNT} worker pools created"
+
+log "Waiting for worker nodes to register (${TOTAL_WORKERS} expected)..."
+for i in $(seq 1 120); do
   READY=$(kubectl get nodes --no-headers 2>/dev/null | grep -c " Ready" || true)
-  if [[ "$READY" -ge $((WORKER_INSTANCE_COUNT + CP_INSTANCE_COUNT)) ]]; then
+  if [[ "$READY" -ge $((TOTAL_WORKERS + CP_INSTANCE_COUNT)) ]]; then
     log "All nodes ready ($READY)"
     break
   fi
-  [[ $i -eq 60 ]] && warn "Timed out waiting for all nodes. Got $READY."
+  [[ $i -eq 120 ]] && warn "Timed out waiting for all nodes. Got $READY/${TOTAL_WORKERS}."
   sleep 10
 done
 
@@ -234,23 +259,6 @@ log "Labels applied"
 kubectl get nodes --show-labels | head -5
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# STEP 7: Build and run kube-inflater
-# ═══════════════════════════════════════════════════════════════════════════════
-banner "Step 7: Deploy hollow nodes with kube-inflater"
-
-cd "$KUBE_INFLATER_DIR"
-
-log "Building kube-inflater..."
-go build -o bin/kube-inflater ./cmd/kube-inflater
-
-log "Running kube-inflater with --containers-per-pod=$CONTAINERS_PER_POD"
-./bin/kube-inflater \
-  --containers-per-pod "$CONTAINERS_PER_POD" \
-  --node-lease-duration 120 \
-  --node-status-frequency 60s \
-  --node-monitor-grace 240s
-
-# ═══════════════════════════════════════════════════════════════════════════════
 # Summary
 # ═══════════════════════════════════════════════════════════════════════════════
 banner "Deployment Complete"
@@ -260,9 +268,10 @@ echo "Resource Group:  $RG_NAME"
 echo "Subscription:    $SUBSCRIPTION"
 echo "Region:          $REGION"
 echo ""
-echo "Worker nodes:    $WORKER_INSTANCE_COUNT x $WORKER_SKU"
-echo "Containers/pod:  $CONTAINERS_PER_POD"
-echo "Expected hollow: ~$((WORKER_INSTANCE_COUNT * CONTAINERS_PER_POD)) nodes"
+echo "Worker pools:    $WORKER_POOL_COUNT x $WORKER_INSTANCE_COUNT $WORKER_SKU"
+echo "Total workers:   $TOTAL_WORKERS"
 echo ""
 echo "Cleanup:"
 echo "  az group delete --name $RG_NAME --yes --no-wait"
+
+watch "kubectl get nodes --chunk-size=0 | wc -l"
