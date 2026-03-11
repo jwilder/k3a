@@ -24,6 +24,7 @@ type KubeadmInstaller struct {
 	credential     *azidentity.DefaultAzureCredential
 	etcdEndpoints  []string // External etcd endpoints (e.g. http://10.0.0.1:2379)
 	k8sVersion     string   // Kubernetes version (e.g. v1.35.2)
+	firstMasterIP  string   // Private IP of the first master node (for additional masters to reach API server during join)
 
 	// Control plane tuning (0 means use default)
 	maxRequestsInflight         int
@@ -188,6 +189,7 @@ func (k *KubeadmInstaller) cleanupStaleTokens(ctx context.Context) error {
 		fmt.Sprintf("%s-worker-join", k.cluster),
 		fmt.Sprintf("%s-master-join", k.cluster),
 		fmt.Sprintf("%s-api-endpoint", k.cluster),
+		fmt.Sprintf("%s-pki-bundle", k.cluster),
 	}
 
 	fmt.Println("Cleaning up stale kubeadm tokens from Key Vault...")
@@ -408,58 +410,39 @@ func (k *KubeadmInstaller) waitForKubeadm() error {
 	return fmt.Errorf("kubeadm did not become available within timeout")
 }
 
-// setupDNSResolution sets up local DNS resolution for the cluster endpoint
-// This is needed because joining nodes need to resolve the DNS name from kubeadm-config
-// but DNS propagation may not be complete yet
-func (k *KubeadmInstaller) setupDNSResolution() error {
-	fmt.Println("Setting up local DNS resolution for cluster endpoint...")
+// setupDNSMapping adds an /etc/hosts entry mapping the LB FQDN to the given IP.
+// Control-plane nodes are in the LB backend pool, so Azure drops hairpin traffic
+// from a backend VM to its own LB frontend IP. This mapping lets kubelet and
+// kubectl on CP nodes reach the API server without going through the LB.
+// Worker nodes are NOT in the backend pool, so they reach the LB normally.
+func (k *KubeadmInstaller) setupDNSMapping(targetIP string) error {
+	dnsName := fmt.Sprintf("%s.%s.cloudapp.azure.com", k.cluster, k.region)
 
-	// Get the first master's internal IP from Key Vault
-	ctx := context.Background()
-	apiEndpoint, err := k.getSecretFromKeyVault(ctx, fmt.Sprintf("%s-api-endpoint", k.cluster))
-	if err != nil {
-		return fmt.Errorf("failed to get API endpoint from Key Vault: %w", err)
-	}
-
-	// Extract the DNS name from the endpoint (format: hostname:6443)
-	dnsName := strings.Split(apiEndpoint, ":")[0]
-
-	// We need to resolve this DNS name to the first master's internal IP
-	// For now, we'll derive the first master IP by getting the master join token and parsing it
-	masterJoinSecretName := fmt.Sprintf("%s-master-join", k.cluster)
-	masterJoin, err := k.getSecretFromKeyVault(ctx, masterJoinSecretName)
-	if err != nil {
-		return fmt.Errorf("failed to get master join token: %w", err)
-	}
-
-	// Extract the IP from the join command (format: "kubeadm join 10.1.0.5:6443 ...")
-	parts := strings.Fields(masterJoin)
-	if len(parts) < 3 {
-		return fmt.Errorf("invalid master join command format")
-	}
-
-	// Get the IP:port from the join command
-	joinEndpoint := parts[2]                             // Should be "10.1.0.5:6443"
-	firstMasterIP := strings.Split(joinEndpoint, ":")[0] // Extract "10.1.0.5"
-
-	// Add DNS resolution to /etc/hosts
-	hostsEntry := fmt.Sprintf("%s %s", firstMasterIP, dnsName)
-	addHostsCmd := fmt.Sprintf("echo '%s' | sudo tee -a /etc/hosts", hostsEntry)
-
-	// Check if entry already exists first
+	// Check if entry already exists
 	checkCmd := fmt.Sprintf("grep -q '%s' /etc/hosts", dnsName)
-	_, err = k.executeCommand(checkCmd)
-	if err != nil {
-		// Entry doesn't exist, add it
-		_, err = k.executeCommand(addHostsCmd)
-		if err != nil {
-			return fmt.Errorf("failed to add DNS entry to /etc/hosts: %w", err)
-		}
-		fmt.Printf("Added DNS resolution: %s -> %s\n", dnsName, firstMasterIP)
-	} else {
-		fmt.Printf("DNS resolution already configured for %s\n", dnsName)
+	if _, err := k.executeCommand(checkCmd); err == nil {
+		fmt.Printf("DNS mapping already configured for %s\n", dnsName)
+		return nil
 	}
 
+	hostsEntry := fmt.Sprintf("%s %s", targetIP, dnsName)
+	addCmd := fmt.Sprintf("echo '%s' | sudo tee -a /etc/hosts", hostsEntry)
+	if _, err := k.executeCommand(addCmd); err != nil {
+		return fmt.Errorf("failed to add DNS mapping to /etc/hosts: %w", err)
+	}
+	fmt.Printf("Added DNS mapping: %s -> %s\n", dnsName, targetIP)
+	return nil
+}
+
+// replaceDNSMapping replaces the existing /etc/hosts FQDN entry with a new target IP.
+func (k *KubeadmInstaller) replaceDNSMapping(newIP string) error {
+	dnsName := fmt.Sprintf("%s.%s.cloudapp.azure.com", k.cluster, k.region)
+	sedCmd := fmt.Sprintf("sudo sed -i 's/^.*%s$/%s %s/' /etc/hosts",
+		strings.ReplaceAll(dnsName, ".", "\\."), newIP, dnsName)
+	if _, err := k.executeCommand(sedCmd); err != nil {
+		return fmt.Errorf("failed to replace DNS mapping in /etc/hosts: %w", err)
+	}
+	fmt.Printf("Replaced DNS mapping: %s -> %s\n", dnsName, newIP)
 	return nil
 }
 
@@ -537,10 +520,11 @@ func (k *KubeadmInstaller) InstallAsFirstMaster(ctx context.Context) error {
 
 	// Construct the DNS name with correct Azure format
 	dnsName := fmt.Sprintf("%s.%s.cloudapp.azure.com", k.cluster, k.region)
-	// Use internal IP for control plane endpoint to avoid external load balancer dependency
-	controlPlaneEndpoint := fmt.Sprintf("%s:6443", internalIP)
-	fmt.Printf("Using internal IP control plane endpoint: %s\n", controlPlaneEndpoint)
-	fmt.Printf("External DNS name for certificates: %s\n", dnsName)
+	// Use LB DNS name as controlPlaneEndpoint so all nodes (including workers) reach
+	// the API server through the load balancer, enabling proper HA.
+	controlPlaneEndpoint := fmt.Sprintf("%s:6443", dnsName)
+	fmt.Printf("Using control plane endpoint: %s\n", controlPlaneEndpoint)
+	fmt.Printf("Internal IP (advertise address): %s\n", internalIP)
 
 	fmt.Println("Initializing Kubernetes cluster...")
 
@@ -658,6 +642,12 @@ profiles:
 	_, err = k.executeCommand(initCommand)
 	if err != nil {
 		return fmt.Errorf("failed to initialize Kubernetes cluster: %w", err)
+	}
+
+	// Map LB FQDN to 127.0.0.1 so this CP node can reach its own API server.
+	// Azure LB drops hairpin traffic from backend VMs to the LB frontend IP.
+	if err := k.setupDNSMapping("127.0.0.1"); err != nil {
+		return fmt.Errorf("failed to setup DNS loopback: %w", err)
 	}
 
 	// Stage 2: Run RBAC-sensitive phases with super-admin.conf (system:masters).
@@ -1033,28 +1023,33 @@ spec:
 		return fmt.Errorf("failed to generate worker join token: %w", err)
 	}
 	workerJoin := strings.TrimSpace(workerJoinOutput)
-
-	// Replace DNS endpoint with internal IP for cluster joining (DNS propagation issue)
-	// The join command should use the internal IP of the master, not the load balancer DNS
-	dnsEndpoint := fmt.Sprintf("%s:6443", dnsName)
-	internalEndpoint := fmt.Sprintf("%s:6443", internalIP)
-	workerJoinForCluster := strings.ReplaceAll(workerJoin, dnsEndpoint, internalEndpoint)
-	workerJoinForCluster = fmt.Sprintf("%s --ignore-preflight-errors=all", workerJoinForCluster)
+	// The join command already uses the LB DNS (controlPlaneEndpoint), so workers
+	// and additional masters reach the API server through the load balancer.
+	workerJoinForCluster := fmt.Sprintf("%s --ignore-preflight-errors=all", workerJoin)
 
 	if err := k.storeSecretInKeyVault(ctx, fmt.Sprintf("%s-worker-join", k.cluster), workerJoinForCluster); err != nil {
 		return err
 	}
 
-	// Master join command will include certificate key after upload-certs
-	certKeyOutput, err := k.executeCommand("sudo kubeadm init phase upload-certs --upload-certs --kubeconfig /etc/kubernetes/super-admin.conf 2>/dev/null | tail -1")
-	if err != nil {
-		return fmt.Errorf("failed to generate certificate key: %w", err)
-	}
-	certKey := strings.TrimSpace(certKeyOutput)
-	masterJoin := fmt.Sprintf("%s --control-plane --certificate-key %s", workerJoinForCluster, certKey)
+	// Master join command: --control-plane only (no --certificate-key).
+	// PKI files are distributed separately via Key Vault to avoid the
+	// download-certs phase which fails with external etcd over HTTP
+	// (kubeadm expects external-etcd.key/crt that don't exist).
+	masterJoin := fmt.Sprintf("%s --control-plane", workerJoinForCluster)
 	if err := k.storeSecretInKeyVault(ctx, fmt.Sprintf("%s-master-join", k.cluster), masterJoin); err != nil {
 		return err
 	}
+
+	// Bundle required PKI files and store in Key Vault for additional masters
+	fmt.Println("Bundling PKI files for additional control-plane nodes...")
+	pkiBundle, err := k.executeCommand("sudo tar czf - -C / etc/kubernetes/pki/ca.crt etc/kubernetes/pki/ca.key etc/kubernetes/pki/sa.key etc/kubernetes/pki/sa.pub etc/kubernetes/pki/front-proxy-ca.crt etc/kubernetes/pki/front-proxy-ca.key | base64 -w0")
+	if err != nil {
+		return fmt.Errorf("failed to bundle PKI files: %w", err)
+	}
+	if err := k.storeSecretInKeyVault(ctx, fmt.Sprintf("%s-pki-bundle", k.cluster), strings.TrimSpace(pkiBundle)); err != nil {
+		return err
+	}
+	fmt.Println("PKI bundle stored in Key Vault")
 
 	// Store API server endpoint (use load balancer public IP for external access)
 	apiEndpoint := externalEndpoint // Use external DNS name for client access
@@ -1087,9 +1082,29 @@ func (k *KubeadmInstaller) InstallAsAdditionalMaster(ctx context.Context) error 
 		fmt.Println("Node is already bootstrapped, skipping prerequisite installation")
 	}
 
-	// Setup DNS resolution for cluster endpoint (needed for kubeadm-config ConfigMap access)
-	if err := k.setupDNSResolution(); err != nil {
-		return fmt.Errorf("failed to setup DNS resolution: %w", err)
+	// Download PKI bundle from Key Vault and extract to /etc/kubernetes/pki/
+	fmt.Println("Downloading PKI bundle from Key Vault...")
+	pkiBundleSecretName := fmt.Sprintf("%s-pki-bundle", k.cluster)
+	pkiBundle, err := k.waitForSecretInKeyVault(ctx, pkiBundleSecretName, 60)
+	if err != nil {
+		return fmt.Errorf("failed to get PKI bundle: %w", err)
+	}
+
+	// Extract PKI bundle on the node
+	fmt.Println("Extracting PKI files...")
+	extractCmd := fmt.Sprintf("echo '%s' | base64 -d | sudo tar xzf - -C /", strings.TrimSpace(pkiBundle))
+	if _, err := k.executeCommand(extractCmd); err != nil {
+		return fmt.Errorf("failed to extract PKI bundle: %w", err)
+	}
+	fmt.Println("PKI files extracted successfully")
+
+	// During join, this node needs to reach the existing API server (first master).
+	// Map the LB FQDN to the first master's private IP so kubeadm join can connect.
+	// After join completes, we'll switch to 127.0.0.1 for the local API server.
+	if k.firstMasterIP != "" {
+		if err := k.setupDNSMapping(k.firstMasterIP); err != nil {
+			return fmt.Errorf("failed to setup DNS redirect to first master: %w", err)
+		}
 	}
 
 	// Wait for master join token to be available
@@ -1101,7 +1116,6 @@ func (k *KubeadmInstaller) InstallAsAdditionalMaster(ctx context.Context) error 
 
 	// Join cluster as additional control-plane node
 	fmt.Println("Joining cluster as additional control-plane node...")
-	// containerd already configured with correct pause image via cloud-init
 
 	// Clean up the join command by removing newlines and extra whitespace
 	cleanedMasterJoin := strings.ReplaceAll(masterJoin, "\n", " ")
@@ -1112,16 +1126,19 @@ func (k *KubeadmInstaller) InstallAsAdditionalMaster(ctx context.Context) error 
 	// Standard path: include ignore-preflight to relax system checks
 	cleanedMasterJoin = fmt.Sprintf("%s --ignore-preflight-errors=all", cleanedMasterJoin)
 
-	// Execute join (kubeadm will perform download-certs if certificate-key present)
+	// Execute join (PKI files already in place, no download-certs needed)
 	joinCommand := fmt.Sprintf("sudo bash -c \"%s\"", strings.ReplaceAll(cleanedMasterJoin, "\"", "\\\""))
 	fmt.Printf("Executing join command: %s\n", joinCommand)
-	output, err2 := k.executeCommand(joinCommand)
-	if err2 != nil {
-		// Detect cert decryption failure and provide remediation hints
-		if strings.Contains(output, "download-certs") || strings.Contains(output, "error decoding secret data") || strings.Contains(output, "message authentication failed") {
-			return fmt.Errorf("failed to join cluster as master: unexpected attempt to download certs (legacy path). Ensure PKI bundle secret exists and join command omits --certificate-key. Raw error: %w", err2)
+	if _, err := k.executeCommand(joinCommand); err != nil {
+		return fmt.Errorf("failed to join cluster as master: %w", err)
+	}
+
+	// Now that the local API server is running, switch FQDN to 127.0.0.1
+	// so kubelet and kubectl use the local API server (avoids LB hairpin).
+	if k.firstMasterIP != "" {
+		if err := k.replaceDNSMapping("127.0.0.1"); err != nil {
+			return fmt.Errorf("failed to switch DNS to loopback: %w", err)
 		}
-		return fmt.Errorf("failed to join cluster as master: %w", err2)
 	}
 
 	// Configure kubectl for azureuser
@@ -1295,28 +1312,26 @@ func (k *KubeadmInstaller) patchKubeadmConfigForMultiMaster(controlPlaneEndpoint
 	var newLines []string
 	added := false
 
+	// Build etcd endpoints lines from the installer's configured endpoints
+	etcdLines := []string{"etcd:", "  external:", "    endpoints:"}
+	for _, ep := range k.etcdEndpoints {
+		etcdLines = append(etcdLines, fmt.Sprintf("    - %s", ep))
+	}
+
 	for _, line := range lines {
 		newLines = append(newLines, line)
 		// Add controlPlaneEndpoint and etcd config after apiVersion line
 		if strings.HasPrefix(line, "apiVersion:") && !added {
 			newLines = append(newLines, fmt.Sprintf("controlPlaneEndpoint: %s", controlPlaneEndpoint))
-			newLines = append(newLines, "etcd:")
-			newLines = append(newLines, "  external:")
-			newLines = append(newLines, "    endpoints:")
-			newLines = append(newLines, "    - http://4.206.93.140:2379")
+			newLines = append(newLines, etcdLines...)
 			added = true
 		}
 	}
 
 	if !added {
 		// If apiVersion wasn't found, add it at the beginning after any initial lines
-		newLines = []string{
-			fmt.Sprintf("controlPlaneEndpoint: %s", controlPlaneEndpoint),
-			"etcd:",
-			"  external:",
-			"    endpoints:",
-			"    - http://4.206.93.140:2379",
-		}
+		newLines = []string{fmt.Sprintf("controlPlaneEndpoint: %s", controlPlaneEndpoint)}
+		newLines = append(newLines, etcdLines...)
 		newLines = append(newLines, lines...)
 	}
 

@@ -16,6 +16,7 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/msi/armmsi"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork"
+	"github.com/jwilder/k3a/cluster"
 	"github.com/jwilder/k3a/loadbalancer/rule"
 	kstrings "github.com/jwilder/k3a/pkg/strings"
 )
@@ -93,14 +94,34 @@ func getSubnet(ctx context.Context, subscriptionID, cluster, vnetName string, cr
 }
 
 // getLoadBalancerPools fetches backend and inbound NAT pools for control plane
-func getLoadBalancerPools(ctx context.Context, subscriptionID, cluster, lbName, poolName string, cred *azidentity.DefaultAzureCredential) ([]*armcompute.SubResource, []*armcompute.SubResource, error) {
+func getLoadBalancerPools(ctx context.Context, subscriptionID, clusterName, location, lbName, poolName string, isControlPlane bool, cred *azidentity.DefaultAzureCredential) ([]*armcompute.SubResource, []*armcompute.SubResource, error) {
+	// Workers use a separate outbound-only LB so they can reach the main LB's
+	// API server frontend without Azure LB hairpin blocking them.
+	targetLBName := lbName
+	clusterHash := kstrings.UniqueString(clusterName)
+	if !isControlPlane {
+		targetLBName = fmt.Sprintf("k3awkrlb%s", clusterHash)
+	}
+
 	lbClient, err := armnetwork.NewLoadBalancersClient(subscriptionID, cred, nil)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to create load balancer client: %w", err)
 	}
-	lb, err := lbClient.Get(ctx, cluster, lbName, nil)
+	lb, err := lbClient.Get(ctx, clusterName, targetLBName, nil)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to get load balancer: %w", err)
+		// Auto-create the worker outbound LB if it doesn't exist yet
+		if !isControlPlane {
+			fmt.Printf("Worker LB %s not found, creating it...\n", targetLBName)
+			if createErr := cluster.CreateWorkerLoadBalancer(ctx, subscriptionID, clusterName, location, clusterHash, cred); createErr != nil {
+				return nil, nil, fmt.Errorf("failed to auto-create worker load balancer: %w", createErr)
+			}
+			lb, err = lbClient.Get(ctx, clusterName, targetLBName, nil)
+			if err != nil {
+				return nil, nil, fmt.Errorf("failed to get worker load balancer after creation: %w", err)
+			}
+		} else {
+			return nil, nil, fmt.Errorf("failed to get load balancer %s: %w", targetLBName, err)
+		}
 	}
 
 	// Use poolName in the backend pool name
@@ -135,7 +156,7 @@ func getLoadBalancerPools(ctx context.Context, subscriptionID, cluster, lbName, 
 		backendPoolParams := armnetwork.BackendAddressPool{
 			Name: to.Ptr(newBackendPoolName),
 		}
-		backendPoolPoller, err := backendPoolsClient.BeginCreateOrUpdate(ctx, cluster, lbName, newBackendPoolName, backendPoolParams, nil)
+		backendPoolPoller, err := backendPoolsClient.BeginCreateOrUpdate(ctx, clusterName, targetLBName, newBackendPoolName, backendPoolParams, nil)
 		if err != nil {
 			return nil, nil, fmt.Errorf("failed to start extra backend address pool creation: %w", err)
 		}
@@ -158,9 +179,16 @@ func getLoadBalancerPools(ctx context.Context, subscriptionID, cluster, lbName, 
 		return nil, nil, fmt.Errorf("no backend pools found or created for VMSS")
 	}
 
+	// Only CP nodes get inbound NAT pools (for SSH); fetch from the main LB
 	var inboundNatPools []*armcompute.SubResource
-	if lb.Properties != nil && lb.Properties.InboundNatPools != nil && len(lb.Properties.InboundNatPools) > 0 {
-		inboundNatPools = []*armcompute.SubResource{{ID: lb.Properties.InboundNatPools[0].ID}}
+	if isControlPlane {
+		mainLB, err := lbClient.Get(ctx, clusterName, lbName, nil)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to get main load balancer for NAT pools: %w", err)
+		}
+		if mainLB.Properties != nil && mainLB.Properties.InboundNatPools != nil && len(mainLB.Properties.InboundNatPools) > 0 {
+			inboundNatPools = []*armcompute.SubResource{{ID: mainLB.Properties.InboundNatPools[0].ID}}
+		}
 	}
 	return backendPools, inboundNatPools, nil
 }
@@ -317,7 +345,6 @@ func installKubeadmOnInstances(ctx context.Context, subscriptionID, cluster, vms
 		if err != nil {
 			return fmt.Errorf("failed to create SSH connection to %s: %w", instance.Name, err)
 		}
-		defer sshClient.Close()
 
 		// Create kubeadm installer
 		installer := NewKubeadmInstaller(subscriptionID, cluster, keyVaultName, sshClient, cred)
@@ -330,27 +357,38 @@ func installKubeadmOnInstances(ctx context.Context, subscriptionID, cluster, vms
 		installer.controllerManagerQPS = tuning.ControllerManagerQPS
 		installer.controllerManagerBurst = tuning.ControllerManagerBurst
 
+		// Additional masters need the first master's IP to reach the API server during join
+		if nodeType == "master" {
+			installer.firstMasterIP = instances[0].PrivateIP
+		}
+
 		// Install based on node type
+		var installErr error
 		switch nodeType {
 		case "first-master":
-			if err := installer.InstallAsFirstMaster(ctx); err != nil {
-				return fmt.Errorf("failed to install first master on %s: %w", instance.Name, err)
+			if installErr = installer.InstallAsFirstMaster(ctx); installErr != nil {
+				sshClient.Close()
+				return fmt.Errorf("failed to install first master on %s: %w", instance.Name, installErr)
 			}
 			// After first master is installed, remaining instances should join as additional masters
 			if role == "control-plane" && i == 0 && len(instancesToProcess) > 1 {
 				nodeType = "master"
 			}
 		case "master":
-			if err := installer.InstallAsAdditionalMaster(ctx); err != nil {
-				return fmt.Errorf("failed to install additional master on %s: %w", instance.Name, err)
+			if installErr = installer.InstallAsAdditionalMaster(ctx); installErr != nil {
+				sshClient.Close()
+				return fmt.Errorf("failed to install additional master on %s: %w", instance.Name, installErr)
 			}
 		case "worker":
-			if err := installer.InstallAsWorker(ctx); err != nil {
-				return fmt.Errorf("failed to install worker on %s: %w", instance.Name, err)
+			if installErr = installer.InstallAsWorker(ctx); installErr != nil {
+				sshClient.Close()
+				return fmt.Errorf("failed to install worker on %s: %w", instance.Name, installErr)
 			}
 		default:
+			sshClient.Close()
 			return fmt.Errorf("unknown node type: %s", nodeType)
 		}
+		sshClient.Close()
 
 		fmt.Printf("Successfully installed kubeadm on instance %s\n", instance.Name)
 	}
@@ -373,7 +411,6 @@ func installKubeadmOnInstances(ctx context.Context, subscriptionID, cluster, vms
 			if err != nil {
 				return fmt.Errorf("failed to create SSH connection to %s: %w", instance.Name, err)
 			}
-			defer sshClient.Close()
 
 			// Create kubeadm installer
 			installer := NewKubeadmInstaller(subscriptionID, cluster, keyVaultName, sshClient, cred)
@@ -385,10 +422,13 @@ func installKubeadmOnInstances(ctx context.Context, subscriptionID, cluster, vms
 			installer.maxPods = tuning.MaxPods
 			installer.controllerManagerQPS = tuning.ControllerManagerQPS
 			installer.controllerManagerBurst = tuning.ControllerManagerBurst
+			installer.firstMasterIP = instances[0].PrivateIP
 
 			if err := installer.InstallAsAdditionalMaster(ctx); err != nil {
+				sshClient.Close()
 				return fmt.Errorf("failed to install additional master on %s: %w", instance.Name, err)
 			}
+			sshClient.Close()
 
 			fmt.Printf("Successfully installed kubeadm as additional master on instance %s\n", instance.Name)
 		}
@@ -610,7 +650,7 @@ func Create(args CreatePoolArgs) error {
 	var backendPools []*armcompute.SubResource
 	var inboundNatPools []*armcompute.SubResource
 	lbName := fmt.Sprintf("k3alb%s", clusterHash)
-	backendPools, inboundNatPools, err = getLoadBalancerPools(ctx, subscriptionID, cluster, lbName, args.Name, cred)
+	backendPools, inboundNatPools, err = getLoadBalancerPools(ctx, subscriptionID, cluster, location, lbName, args.Name, isControlPlane, cred)
 	if err != nil {
 		return err
 	}

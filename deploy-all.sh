@@ -36,10 +36,10 @@ CONTROLLER_MANAGER_QPS=500
 CONTROLLER_MANAGER_BURST=600
 
 # Pool sizing
-CP_INSTANCE_COUNT=1
+CP_INSTANCE_COUNT=3
 CP_SKU="Standard_D96s_v5"
-WORKER_POOL_COUNT=10
-WORKER_INSTANCE_COUNT=90
+WORKER_POOL_COUNT=1
+WORKER_INSTANCE_COUNT=3
 WORKER_SKU="Standard_D16s_v3"
 
 # ─── Colors ──────────────────────────────────────────────────────────────────
@@ -250,10 +250,8 @@ kubectl get nodes
 # ═══════════════════════════════════════════════════════════════════════════════
 banner "Step 6: Label worker nodes"
 
-kubectl get nodes -o name | grep -v "cp-" | while read -r node; do
-  kubectl label "$node" node-role.kubernetes.io/worker=worker --overwrite 2>/dev/null || true
-  kubectl label "$node" node.kubernetes.io/instance-type=k3s --overwrite 2>/dev/null || true
-done
+kubectl label nodes -l '!node-role.kubernetes.io/control-plane' node-role.kubernetes.io/worker=worker --overwrite
+kubectl label nodes -l '!node-role.kubernetes.io/control-plane' node.kubernetes.io/instance-type=k3s --overwrite
 
 log "Labels applied"
 kubectl get nodes --show-labels | head -5

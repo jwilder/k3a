@@ -354,6 +354,14 @@ func Create(args CreateArgs) error {
 		return fmt.Errorf("failed to create Load Balancer: %w", err)
 	}
 
+	// Create a separate outbound-only LB for worker nodes.
+	// Workers must NOT be in the same LB as the API server frontend because
+	// Azure Standard LB drops hairpin traffic from any backend VM to its own
+	// frontend IP, which prevents workers from reaching the API server.
+	if err := CreateWorkerLoadBalancer(ctx, subscriptionID, cluster, location, clusterHash, cred); err != nil {
+		return fmt.Errorf("failed to create Worker Load Balancer: %w", err)
+	}
+
 	// Output the cluster information
 	fmt.Printf("Cluster resources created successfully!\n")
 	fmt.Printf("Load Balancer DNS: %s\n", lbDNSName)
@@ -462,6 +470,29 @@ func createNetworkSecurityGroup(ctx context.Context, subscriptionID, resourceGro
 		} else {
 			fmt.Println("AllowCallerIP NSG rule added successfully")
 		}
+	}
+
+	// Allow inbound 6443 from AzureCloud so workers on the same VNet can reach
+	// the API server through the LB public frontend (covers LB probes + agent traffic).
+	fmt.Println("Adding agents-6443 NSG rule...")
+	agentsRule := armnetwork.SecurityRule{
+		Name: to.Ptr("agents-6443"),
+		Properties: &armnetwork.SecurityRulePropertiesFormat{
+			Priority:                 to.Ptr[int32](210),
+			Direction:                to.Ptr(armnetwork.SecurityRuleDirectionInbound),
+			Access:                   to.Ptr(armnetwork.SecurityRuleAccessAllow),
+			Protocol:                 to.Ptr(armnetwork.SecurityRuleProtocolAsterisk),
+			SourceAddressPrefix:      to.Ptr("AzureCloud"),
+			SourcePortRange:          to.Ptr("*"),
+			DestinationAddressPrefix: to.Ptr("*"),
+			DestinationPortRange:     to.Ptr("6443"),
+		},
+	}
+	_, err = securityRulesClient.BeginCreateOrUpdate(ctx, resourceGroup, nsgName, "agents-6443", agentsRule, nil)
+	if err != nil {
+		fmt.Printf("Warning: failed to add agents-6443 NSG rule: %v\n", err)
+	} else {
+		fmt.Println("agents-6443 NSG rule added successfully")
 	}
 
 	return *finalResp.SecurityGroup.ID, nil
@@ -698,6 +729,90 @@ func createLoadBalancer(ctx context.Context, subscriptionID, resourceGroup, loca
 	fmt.Printf("Public IP FQDN: %s\n", publicIPFQDN)
 
 	return publicIPFQDN, nil
+}
+
+// createWorkerLoadBalancer provisions an outbound-only Standard Load Balancer for
+// worker nodes. Workers need outbound internet (image pulls, DNS, etc.) but must
+// NOT share an LB with the API server frontend — Azure Standard LB drops hairpin
+// traffic from any backend VM to any frontend IP of the same LB.
+func CreateWorkerLoadBalancer(ctx context.Context, subscriptionID, resourceGroup, location, clusterHash string, cred *azidentity.DefaultAzureCredential) error {
+	lbName := fmt.Sprintf("k3awkrlb%s", clusterHash)
+
+	publicIPClient, err := armnetwork.NewPublicIPAddressesClient(subscriptionID, cred, nil)
+	if err != nil {
+		return fmt.Errorf("failed to create public IP client: %w", err)
+	}
+
+	// Create 5 outbound public IPs for worker SNAT
+	outboundFrontendIPRefs := []*armnetwork.SubResource{}
+	frontendIPConfigurations := []*armnetwork.FrontendIPConfiguration{}
+	for i := 0; i < 5; i++ {
+		ipName := fmt.Sprintf("%s-outbound-ip-%d", lbName, i+1)
+		_, err = publicIPClient.BeginCreateOrUpdate(ctx, resourceGroup, ipName, armnetwork.PublicIPAddress{
+			Location: to.Ptr(location),
+			SKU:      &armnetwork.PublicIPAddressSKU{Name: to.Ptr(armnetwork.PublicIPAddressSKUNameStandard)},
+			Properties: &armnetwork.PublicIPAddressPropertiesFormat{
+				PublicIPAllocationMethod: to.Ptr(armnetwork.IPAllocationMethodStatic),
+			},
+		}, nil)
+		if err != nil {
+			return fmt.Errorf("failed to create worker outbound public IP %d: %w", i+1, err)
+		}
+
+		frontendName := fmt.Sprintf("outbound-frontend-%d", i+1)
+		pip, err := publicIPClient.Get(ctx, resourceGroup, ipName, nil)
+		if err != nil {
+			return fmt.Errorf("failed to get worker outbound public IP %d: %w", i+1, err)
+		}
+
+		frontendIPConfigurations = append(frontendIPConfigurations, &armnetwork.FrontendIPConfiguration{
+			Name: to.Ptr(frontendName),
+			Properties: &armnetwork.FrontendIPConfigurationPropertiesFormat{
+				PublicIPAddress: &armnetwork.PublicIPAddress{ID: pip.ID},
+			},
+		})
+		outboundFrontendIPRefs = append(outboundFrontendIPRefs, &armnetwork.SubResource{
+			ID: to.Ptr(fmt.Sprintf("/subscriptions/%s/resourceGroups/%s/providers/Microsoft.Network/loadBalancers/%s/frontendIPConfigurations/%s",
+				subscriptionID, resourceGroup, lbName, frontendName)),
+		})
+	}
+
+	backendPoolName := "outbound-pool"
+	lbClient, err := armnetwork.NewLoadBalancersClient(subscriptionID, cred, nil)
+	if err != nil {
+		return fmt.Errorf("failed to create load balancer client: %w", err)
+	}
+
+	_, err = lbClient.BeginCreateOrUpdate(ctx, resourceGroup, lbName, armnetwork.LoadBalancer{
+		Location: to.Ptr(location),
+		SKU:      &armnetwork.LoadBalancerSKU{Name: to.Ptr(armnetwork.LoadBalancerSKUNameStandard)},
+		Properties: &armnetwork.LoadBalancerPropertiesFormat{
+			FrontendIPConfigurations: frontendIPConfigurations,
+			BackendAddressPools: []*armnetwork.BackendAddressPool{
+				{Name: to.Ptr(backendPoolName)},
+			},
+			OutboundRules: []*armnetwork.OutboundRule{
+				{
+					Name: to.Ptr("WorkerOutboundRule"),
+					Properties: &armnetwork.OutboundRulePropertiesFormat{
+						BackendAddressPool: &armnetwork.SubResource{
+							ID: to.Ptr(fmt.Sprintf("/subscriptions/%s/resourceGroups/%s/providers/Microsoft.Network/loadBalancers/%s/backendAddressPools/%s",
+								subscriptionID, resourceGroup, lbName, backendPoolName)),
+						},
+						FrontendIPConfigurations: outboundFrontendIPRefs,
+						Protocol:                 to.Ptr(armnetwork.LoadBalancerOutboundRuleProtocolAll),
+						AllocatedOutboundPorts:   to.Ptr[int32](192),
+					},
+				},
+			},
+		},
+	}, nil)
+	if err != nil {
+		return fmt.Errorf("failed to create worker load balancer: %w", err)
+	}
+
+	fmt.Printf("Worker outbound load balancer created: %s\n", lbName)
+	return nil
 }
 
 // getSecretFromKeyVault retrieves a secret value from Azure Key Vault
