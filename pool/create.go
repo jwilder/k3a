@@ -124,56 +124,48 @@ func getLoadBalancerPools(ctx context.Context, subscriptionID, clusterName, loca
 		}
 	}
 
-	// Use poolName in the backend pool name
-	backendPoolName := "outbound-pool"
-	// Always add the VMSS to the existing backend pool (if found)
-	var existingBackendPoolID *string
+	// Find the outbound-pool and backend pool on the LB
+	var outboundPoolID, backendPoolID *string
 	if lb.Properties != nil && lb.Properties.BackendAddressPools != nil {
 		for _, bp := range lb.Properties.BackendAddressPools {
-			if bp.Name != nil && *bp.Name == backendPoolName {
-				existingBackendPoolID = bp.ID
-				break
+			if bp.Name == nil {
+				continue
+			}
+			switch *bp.Name {
+			case "outbound-pool":
+				outboundPoolID = bp.ID
+			case "backend":
+				backendPoolID = bp.ID
 			}
 		}
 	}
 
-	// Create a new backend pool for this VMSS
-	newBackendPoolName := fmt.Sprintf("%s-backend-pool", poolName)
-	var newBackendPoolID *string
-	if lb.Properties != nil && lb.Properties.BackendAddressPools != nil {
-		for _, bp := range lb.Properties.BackendAddressPools {
-			if bp.Name != nil && *bp.Name == newBackendPoolName {
-				newBackendPoolID = bp.ID
-				break
-			}
-		}
-	}
-	if newBackendPoolID == nil {
+	// Auto-create the backend pool if it doesn't exist yet
+	if backendPoolID == nil {
 		backendPoolsClient, err := armnetwork.NewLoadBalancerBackendAddressPoolsClient(subscriptionID, cred, nil)
 		if err != nil {
-			return nil, nil, fmt.Errorf("failed to get load balancer: %w", err)
+			return nil, nil, fmt.Errorf("failed to create backend pool client: %w", err)
 		}
-		backendPoolParams := armnetwork.BackendAddressPool{
-			Name: to.Ptr(newBackendPoolName),
-		}
-		backendPoolPoller, err := backendPoolsClient.BeginCreateOrUpdate(ctx, clusterName, targetLBName, newBackendPoolName, backendPoolParams, nil)
+		poller, err := backendPoolsClient.BeginCreateOrUpdate(ctx, clusterName, targetLBName, "backend", armnetwork.BackendAddressPool{
+			Name: to.Ptr("backend"),
+		}, nil)
 		if err != nil {
-			return nil, nil, fmt.Errorf("failed to start extra backend address pool creation: %w", err)
+			return nil, nil, fmt.Errorf("failed to start backend pool creation: %w", err)
 		}
-		backendPoolResp, err := backendPoolPoller.PollUntilDone(ctx, nil)
+		resp, err := poller.PollUntilDone(ctx, nil)
 		if err != nil {
-			return nil, nil, fmt.Errorf("failed to create extra backend address pool: %w", err)
+			return nil, nil, fmt.Errorf("failed to create backend pool: %w", err)
 		}
-		newBackendPoolID = backendPoolResp.ID
+		backendPoolID = resp.ID
 	}
 
-	// Add both backend pools to the VMSS
+	// Add both pools to the VMSS — outbound-pool for SNAT, backend for shared membership
 	var backendPools []*armcompute.SubResource
-	if existingBackendPoolID != nil {
-		backendPools = append(backendPools, &armcompute.SubResource{ID: existingBackendPoolID})
+	if outboundPoolID != nil {
+		backendPools = append(backendPools, &armcompute.SubResource{ID: outboundPoolID})
 	}
-	if newBackendPoolID != nil {
-		backendPools = append(backendPools, &armcompute.SubResource{ID: newBackendPoolID})
+	if backendPoolID != nil {
+		backendPools = append(backendPools, &armcompute.SubResource{ID: backendPoolID})
 	}
 	if len(backendPools) == 0 {
 		return nil, nil, fmt.Errorf("no backend pools found or created for VMSS")

@@ -790,6 +790,7 @@ func CreateWorkerLoadBalancer(ctx context.Context, subscriptionID, resourceGroup
 			FrontendIPConfigurations: frontendIPConfigurations,
 			BackendAddressPools: []*armnetwork.BackendAddressPool{
 				{Name: to.Ptr(backendPoolName)},
+				{Name: to.Ptr("backend")},
 			},
 			OutboundRules: []*armnetwork.OutboundRule{
 				{

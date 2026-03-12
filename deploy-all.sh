@@ -38,8 +38,8 @@ CONTROLLER_MANAGER_BURST=600
 # Pool sizing
 CP_INSTANCE_COUNT=3
 CP_SKU="Standard_D96s_v5"
-WORKER_POOL_COUNT=1
-WORKER_INSTANCE_COUNT=3
+WORKER_POOL_COUNT=10
+WORKER_INSTANCE_COUNT=90
 WORKER_SKU="Standard_D16s_v3"
 
 # ─── Colors ──────────────────────────────────────────────────────────────────
@@ -87,7 +87,7 @@ banner "Step 1: Deploy Dovetail"
   --cluster-name "$RG_NAME" \
   --location "$REGION" \
   --vm-size "Standard_D96s_v5" \
-  --postgres-sku "Standard_D96ads_v5" \
+  --postgres-sku "Standard_D64ads_v5" \
   --postgres-tier "P40" \
   --postgres-storage 2048 \
   --yes
