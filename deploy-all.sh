@@ -9,24 +9,13 @@ set -euo pipefail
 # ─── Configuration ───────────────────────────────────────────────────────────
 SUBSCRIPTION="110efc33-11a4-46b9-9986-60716283fbe7"
 REGION="canadacentral"
-CLUSTER_PREFIX="k3a-canadacentral-vapa-200k"
+CLUSTER_PREFIX="${CLUSTER_PREFIX:-k3a-canadacentral-vapa-200k}"
 
-# Auto-increment RUN_ID using a state file
 RUN_ID_FILE="${HOME}/.k3a-deploy-run-id"
-if [[ -f "$RUN_ID_FILE" ]]; then
-  RUN_ID=$(( $(cat "$RUN_ID_FILE") + 1 ))
-else
-  RUN_ID=1
-fi
-echo "$RUN_ID" > "$RUN_ID_FILE"
-
-# Single resource group for everything
-RG_NAME="${CLUSTER_PREFIX}-${RUN_ID}"
-K3A_CLUSTER="${RG_NAME}"
 
 # Paths (adjust if your repos are elsewhere)
-DOVETAIL_DIR="$HOME/dev/dovetail"
-K3A_DIR="$HOME/k3a"
+DOVETAIL_DIR="${DOVETAIL_DIR:-$HOME/dev/dovetail}"
+K3A_DIR="${K3A_DIR:-$HOME/k3a}"
 
 # Control plane tuning for 100K hollow nodes
 MAX_REQUESTS_INFLIGHT=3000
@@ -53,6 +42,49 @@ banner() { echo -e "\n${CYAN}═════════════════
 log()    { echo -e "${GREEN}[INFO]${NC} $1"; }
 warn()   { echo -e "${YELLOW}[WARN]${NC} $1"; }
 fail()   { echo -e "${RED}[FAIL]${NC} $1" >&2; exit 1; }
+
+print_help() {
+  cat <<EOF
+Usage: $(basename "$0") [--help|-h]
+
+Configurable environment variables:
+  CLUSTER_PREFIX  Prefix used to build resource names.
+  DOVETAIL_DIR    Path to your Dovetail repo.
+  K3A_DIR         Path to your k3a repo.
+  AUTO_APPROVE    Set to 1 to skip the interactive confirmation prompt.
+
+Current effective values:
+  CLUSTER_PREFIX="$CLUSTER_PREFIX"
+  DOVETAIL_DIR="$DOVETAIL_DIR"
+  K3A_DIR="$K3A_DIR"
+  AUTO_APPROVE="${AUTO_APPROVE:-0}"
+
+Quick copy/paste setup:
+export CLUSTER_PREFIX="$CLUSTER_PREFIX"
+export DOVETAIL_DIR="$DOVETAIL_DIR"
+export K3A_DIR="$K3A_DIR"
+export AUTO_APPROVE=1
+EOF
+}
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  print_help
+  exit 0
+fi
+
+[[ $# -eq 0 ]] || fail "Unknown argument: $1 (use --help)"
+
+# Auto-increment RUN_ID using a state file
+if [[ -f "$RUN_ID_FILE" ]]; then
+  RUN_ID=$(( $(cat "$RUN_ID_FILE") + 1 ))
+else
+  RUN_ID=1
+fi
+echo "$RUN_ID" > "$RUN_ID_FILE"
+
+# Single resource group for everything
+RG_NAME="${CLUSTER_PREFIX}-${RUN_ID}"
+K3A_CLUSTER="${RG_NAME}"
 
 # ─── Pre-flight checks ──────────────────────────────────────────────────────
 banner "Pre-flight checks"

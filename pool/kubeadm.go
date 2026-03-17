@@ -2,17 +2,101 @@ package pool
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/Azure/azure-sdk-for-go/sdk/security/keyvault/azsecrets"
 	"golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh/agent"
+	"golang.org/x/term"
 )
+
+// sshPassphraseCache holds a cached SSH key passphrase so users are only prompted once.
+type sshPassphraseCache struct {
+	mu         sync.Mutex
+	passphrase []byte
+	prompted   bool
+}
+
+var cachedPassphrase sshPassphraseCache
+
+// parseSSHPrivateKey parses a PEM-encoded private key, prompting for a passphrase
+// (once, then caching it) if the key is passphrase-protected.
+func parseSSHPrivateKey(privateKeyBytes []byte) (ssh.Signer, error) {
+	signer, err := ssh.ParsePrivateKey(privateKeyBytes)
+	if err == nil {
+		return signer, nil
+	}
+
+	var missingErr *ssh.PassphraseMissingError
+	if !errors.As(err, &missingErr) {
+		return nil, fmt.Errorf("failed to parse private key: %w", err)
+	}
+
+	cachedPassphrase.mu.Lock()
+	defer cachedPassphrase.mu.Unlock()
+
+	if !cachedPassphrase.prompted {
+		fmt.Print("Enter passphrase for SSH private key: ")
+		passphrase, readErr := term.ReadPassword(int(os.Stdin.Fd()))
+		fmt.Println()
+		if readErr != nil {
+			return nil, fmt.Errorf("failed to read passphrase: %w", readErr)
+		}
+		cachedPassphrase.passphrase = passphrase
+		cachedPassphrase.prompted = true
+	}
+
+	signer, err = ssh.ParsePrivateKeyWithPassphrase(privateKeyBytes, cachedPassphrase.passphrase)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse private key with passphrase: %w", err)
+	}
+	return signer, nil
+}
+
+// buildSSHAuthMethods returns SSH auth methods, preferring the SSH agent when
+// SSH_AUTH_SOCK is set and falling back to the key file (prompting for a
+// passphrase lazily only if the agent cannot authenticate).
+func buildSSHAuthMethods(privateKeyPath string) []ssh.AuthMethod {
+	var methods []ssh.AuthMethod
+
+	// Prefer SSH agent when available.
+	if sock := os.Getenv("SSH_AUTH_SOCK"); sock != "" {
+		conn, err := net.Dial("unix", sock)
+		if err == nil {
+			agentClient := agent.NewClient(conn)
+			methods = append(methods, ssh.PublicKeysCallback(agentClient.Signers))
+		}
+	}
+
+	// Always add key file as a lazy fallback — the callback is only invoked
+	// when all preceding methods fail, so the passphrase is never prompted
+	// when the agent handles authentication successfully.
+	keyPath := privateKeyPath
+	if keyPath == "" {
+		keyPath = filepath.Join(os.Getenv("HOME"), ".ssh", "id_rsa")
+	}
+	methods = append(methods, ssh.PublicKeysCallback(func() ([]ssh.Signer, error) {
+		privateKeyBytes, err := os.ReadFile(keyPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read private key: %w", err)
+		}
+		signer, err := parseSSHPrivateKey(privateKeyBytes)
+		if err != nil {
+			return nil, err
+		}
+		return []ssh.Signer{signer}, nil
+	}))
+
+	return methods
+}
 
 // KubeadmInstaller handles kubeadm installation and cluster setup
 type KubeadmInstaller struct {
@@ -1205,35 +1289,15 @@ func (k *KubeadmInstaller) InstallAsWorker(ctx context.Context) error {
 	return nil
 }
 
-// CreateSSHClient creates an SSH client connection to the target VM via load balancer NAT
+// CreateSSHClientViaNAT creates an SSH client connection to the target VM via load balancer NAT
 func CreateSSHClientViaNAT(lbPublicIP string, natPort int, username, privateKeyPath string) (*ssh.Client, error) {
-	// Read private key
-	if privateKeyPath == "" {
-		privateKeyPath = filepath.Join(os.Getenv("HOME"), ".ssh", "id_rsa")
-	}
-
-	privateKeyBytes, err := os.ReadFile(privateKeyPath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read private key: %w", err)
-	}
-
-	// Parse private key
-	signer, err := ssh.ParsePrivateKey(privateKeyBytes)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse private key: %w", err)
-	}
-
-	// Create SSH config
 	config := &ssh.ClientConfig{
-		User: username,
-		Auth: []ssh.AuthMethod{
-			ssh.PublicKeys(signer),
-		},
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(), // In production, use proper host key verification
+		User:            username,
+		Auth:            buildSSHAuthMethods(privateKeyPath),
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
 		Timeout:         30 * time.Second,
 	}
 
-	// Connect to SSH server via load balancer NAT
 	address := fmt.Sprintf("%s:%d", lbPublicIP, natPort)
 	fmt.Printf("Connecting to SSH via NAT: %s\n", address)
 
@@ -1247,33 +1311,13 @@ func CreateSSHClientViaNAT(lbPublicIP string, natPort int, username, privateKeyP
 
 // CreateSSHClient creates an SSH client connection to the target VM (deprecated - use CreateSSHClientViaNAT for VMSS)
 func CreateSSHClient(host, username, privateKeyPath string) (*ssh.Client, error) {
-	// Read private key
-	if privateKeyPath == "" {
-		privateKeyPath = filepath.Join(os.Getenv("HOME"), ".ssh", "id_rsa")
-	}
-
-	privateKeyBytes, err := os.ReadFile(privateKeyPath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read private key: %w", err)
-	}
-
-	// Parse private key
-	signer, err := ssh.ParsePrivateKey(privateKeyBytes)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse private key: %w", err)
-	}
-
-	// Create SSH config
 	config := &ssh.ClientConfig{
-		User: username,
-		Auth: []ssh.AuthMethod{
-			ssh.PublicKeys(signer),
-		},
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(), // In production, use proper host key verification
+		User:            username,
+		Auth:            buildSSHAuthMethods(privateKeyPath),
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
 		Timeout:         30 * time.Second,
 	}
 
-	// Connect to SSH server
 	client, err := ssh.Dial("tcp", net.JoinHostPort(host, "22"), config)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to SSH server: %w", err)
