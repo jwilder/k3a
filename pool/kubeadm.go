@@ -667,6 +667,8 @@ apiServer:
     value: "%d"
   - name: max-mutating-requests-inflight
     value: "%d"
+  - name: goaway-chance
+    value: "0.02"
   - name: etcd-compaction-interval
     value: "0"
 controllerManager:
