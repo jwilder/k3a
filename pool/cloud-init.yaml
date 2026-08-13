@@ -1,4 +1,5 @@
 #cloud-config
+# k3a-k8s-version: {{ .K8sVersion }}
 
 package_update: true
 packages:
@@ -6,6 +7,7 @@ packages:
   - curl
   - azure-cli
   - python3
+  - iptables
 
 write_files:
   - path: /etc/rancher/k3s/registries.yaml

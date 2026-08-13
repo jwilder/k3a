@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/jwilder/k3a/pkg/spinner"
 	"github.com/jwilder/k3a/pool"
@@ -11,7 +12,7 @@ import (
 
 var poolCmd = &cobra.Command{
 	Use:   "pool",
-	Short: "Manage VMSS pools (list, create, delete, scale)",
+	Short: "Manage VMSS pools (list, create, delete, scale, upgrade)",
 }
 
 var listPoolsCmd = &cobra.Command{
@@ -139,6 +140,36 @@ var scalePoolCmd = &cobra.Command{
 	},
 }
 
+var upgradePoolCmd = &cobra.Command{
+	Use:   "upgrade",
+	Short: "Roll a VMSS pool forward to the current k3a baseline.",
+	Long:  "Update a VMSS pool image model to the baseline used for new k3a pools, then drain, update, verify, and uncordon each Kubernetes node sequentially.",
+	RunE: func(cmd *cobra.Command, args []string) error {
+		subscriptionID, _ := cmd.Root().Flags().GetString("subscription")
+		if subscriptionID == "" {
+			return fmt.Errorf("--subscription flag is required (or set K3A_SUBSCRIPTION)")
+		}
+		cluster, _ := cmd.Flags().GetString("cluster")
+		if cluster == "" {
+			return fmt.Errorf("--cluster flag is required (or set K3A_CLUSTER)")
+		}
+		name, _ := cmd.Flags().GetString("name")
+		if name == "" {
+			return fmt.Errorf("--name flag is required")
+		}
+		modelOnly, _ := cmd.Flags().GetBool("model-only")
+		nodeTimeout, _ := cmd.Flags().GetDuration("node-timeout")
+
+		return pool.Upgrade(pool.UpgradePoolArgs{
+			SubscriptionID: subscriptionID,
+			Cluster:        cluster,
+			Name:           name,
+			ModelOnly:      modelOnly,
+			NodeTimeout:    nodeTimeout,
+		})
+	},
+}
+
 func init() {
 	clusterDefault := ""
 	if v := os.Getenv("K3A_CLUSTER"); v != "" {
@@ -174,8 +205,15 @@ func init() {
 	_ = scalePoolCmd.MarkFlagRequired("name")
 	_ = scalePoolCmd.MarkFlagRequired("instance-count")
 
+	// Pool upgrade flags
+	upgradePoolCmd.Flags().String("cluster", clusterDefault, "Cluster name (or set K3A_CLUSTER) (required)")
+	upgradePoolCmd.Flags().String("name", "", "Name of the node pool (required)")
+	upgradePoolCmd.Flags().Bool("model-only", false, "Update the VMSS model without rolling existing instances")
+	upgradePoolCmd.Flags().Duration("node-timeout", 15*time.Minute, "Maximum time to drain or wait for each node")
+	_ = upgradePoolCmd.MarkFlagRequired("name")
+
 	poolCmd.AddCommand(instancesPoolCmd)
-	poolCmd.AddCommand(listPoolsCmd, createPoolCmd, deletePoolCmd, scalePoolCmd)
+	poolCmd.AddCommand(listPoolsCmd, createPoolCmd, deletePoolCmd, scalePoolCmd, upgradePoolCmd)
 
 	rootCmd.AddCommand(poolCmd)
 }

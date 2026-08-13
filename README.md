@@ -1,4 +1,4 @@
-# k3a ![MIT License](https://img.shields.io/badge/license-MIT-green.svg) ![Go Version](https://img.shields.io/badge/Go-1.24%2B-blue.svg) ![Azure](https://img.shields.io/badge/Azure-Ready-brightgreen.svg)
+# k3a ![MIT License](https://img.shields.io/badge/license-MIT-green.svg) ![Go Version](https://img.shields.io/badge/Go-1.26.5-blue.svg) ![Azure](https://img.shields.io/badge/Azure-Ready-brightgreen.svg)
 
 k3a is a command-line tool for deploying and managing lightweight Kubernetes clusters on Azure using [k3s](https://k3s.io/). It aims to reduce operational overhead and complexity, providing a minimal and opinionated approach to cluster management.
 
@@ -26,8 +26,9 @@ Managing Kubernetes clusters and networking in Azure can be complex. k3a address
 ## Getting Started
 
 ### Prerequisites
-- Go 1.24 or later
+- Go 1.26 or later
 - Azure CLI installed and authenticated (`az login`)
+- `kubectl` installed (used internally by `k3a pool upgrade`)
 - Sufficient Azure permissions
 
 ### Installation
@@ -117,6 +118,20 @@ k3a pool list --cluster my-cluster
 ```sh
 k3a pool scale --cluster my-cluster --name worker-pool --instance-count 5
 ```
+
+### Upgrade a Node Pool
+
+Upgrade the VMSS model and roll its instances one at a time:
+
+```sh
+k3a pool upgrade --cluster my-cluster --name worker-pool
+```
+
+The command verifies that the baseline image is available in the VMSS region, updates the image and cloud-init model together while preserving the installed k3s version, then retrieves the admin kubeconfig from Key Vault and internally drains, updates, waits for, and uncordons each node. It stops on the first failure and does not proceed to the next instance. PodDisruptionBudgets are honored.
+
+> A single-instance control-plane pool will be unavailable while its instance is updated. For a highly available control plane, keep a majority of control-plane instances Ready throughout the rollout.
+
+Use `--model-only` to update only the VMSS model without changing existing instances.
 
 ### Delete a Node Pool
 
