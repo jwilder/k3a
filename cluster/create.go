@@ -508,6 +508,18 @@ func createVirtualNetwork(ctx context.Context, subscriptionID, resourceGroup, lo
 	return nil
 }
 
+func classifyAzurePostgresCreateError(err error) bool {
+	var respErr *azcore.ResponseError
+	if !errors.As(err, &respErr) {
+		return false
+	}
+	if respErr.ErrorCode == "PrivateDnsZoneNameNotValid" {
+		return true
+	}
+	statusCode := respErr.StatusCode
+	return statusCode == http.StatusRequestTimeout || statusCode == http.StatusConflict || statusCode == http.StatusTooManyRequests || (statusCode >= 500 && statusCode < 600)
+}
+
 // createPostgresFlexibleServer provisions an Azure PostgreSQL Flexible Server matching the Bicep module configuration
 func createPostgresFlexibleServer(ctx context.Context, subscriptionID, resourceGroup, location, vnetNamePrefix, adminUsername, adminPassword, serverName string, cred *azidentity.DefaultAzureCredential) error {
 	serversClient, err := armpostgresqlflexibleservers.NewServersClient(subscriptionID, cred, nil)
@@ -558,13 +570,17 @@ func createPostgresFlexibleServer(ctx context.Context, subscriptionID, resourceG
 		},
 	}
 
-	poller, err := serversClient.BeginCreate(ctx, resourceGroup, serverName, parameters, nil)
-	if err != nil {
-		return fmt.Errorf("failed to begin postgres server creation: %w", err)
-	}
-	_, err = poller.PollUntilDone(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("failed to create postgres server: %w", err)
+	if err := retry.RetryWithDelays(ctx, []time.Duration{10 * time.Second, 30 * time.Second, 60 * time.Second}, classifyAzurePostgresCreateError, func(ctx context.Context) error {
+		poller, err := serversClient.BeginCreate(ctx, resourceGroup, serverName, parameters, nil)
+		if err != nil {
+			return fmt.Errorf("failed to begin postgres server creation: %w", err)
+		}
+		if _, err := poller.PollUntilDone(ctx, nil); err != nil {
+			return fmt.Errorf("failed to create postgres server: %w", err)
+		}
+		return nil
+	}); err != nil {
+		return err
 	}
 
 	// Link the Postgres private DNS zone to the VNet

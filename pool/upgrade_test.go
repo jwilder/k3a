@@ -2,6 +2,9 @@ package pool
 
 import (
 	"encoding/base64"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -157,9 +160,106 @@ func TestCloudInitBaselinePackages(t *testing.T) {
 		t.Fatal(err)
 	}
 	cloudInit := string(decoded)
-	for _, expected := range []string{"# k3a-k8s-version: v1.33.1", "  - azure-cli", "  - iptables"} {
+	for _, expected := range []string{"# k3a-k8s-version: v1.33.1", "  - ca-certificates", "  - azure-cli", "  - iptables", "set -eu", "tdnf install -y ca-certificates azure-cli", "az version --output none"} {
 		if !strings.Contains(cloudInit, expected) {
 			t.Fatalf("rendered cloud-init does not contain %q", expected)
 		}
+	}
+}
+
+func TestCloudInitBootstrap(t *testing.T) {
+	for _, role := range []string{"control-plane", "worker"} {
+		t.Run(role, func(t *testing.T) {
+			encoded, err := getCloudInitData(map[string]string{
+				"KeyVaultName": "test-vault", "PostgresName": "test-postgres",
+				"PostgresSuffix": "postgres.database.azure.com", "Role": role,
+				"ResourceGroup": "test-cluster", "ExternalIP": "192.0.2.1",
+				"K8sVersion": "v1.33.1", "MSIClientID": "00000000-0000-0000-0000-000000000000",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			decoded, err := base64.StdEncoding.DecodeString(encoded)
+			if err != nil {
+				t.Fatal(err)
+			}
+			cloudInit := string(decoded)
+			if strings.Contains(cloudInit, "export POSTGRES_PASSWORD=$(") || strings.Contains(cloudInit, "| INSTALL_K3S_VERSION=") {
+				t.Fatal("bootstrap masks a credential lookup or download failure")
+			}
+			if role == "control-plane" {
+				for _, expected := range []string{
+					"POSTGRES_PASSWORD=$(az keyvault secret show", "if [ -z \"$POSTGRES_PASSWORD\" ]; then",
+					"export POSTGRES_PASSWORD\n", "safe=''", "--file \"$KUBECONFIG_EXTERNAL_PATH\" --output none",
+				} {
+					if !strings.Contains(cloudInit, expected) {
+						t.Fatalf("control-plane bootstrap does not contain %q", expected)
+					}
+				}
+			} else if strings.Contains(cloudInit, "POSTGRES_PASSWORD=") {
+				t.Fatal("worker bootstrap unnecessarily retrieves the PostgreSQL password")
+			}
+			configFile := filepath.Join(t.TempDir(), "cloud-init.yaml")
+			if err := os.WriteFile(configFile, decoded, 0600); err != nil {
+				t.Fatal(err)
+			}
+			if cloudInitPath, err := exec.LookPath("cloud-init"); err == nil {
+				if output, err := exec.Command(cloudInitPath, "schema", "--config-file", configFile).CombinedOutput(); err != nil {
+					t.Fatalf("cloud-init schema: %v\n%s", err, output)
+				}
+			}
+			pythonPath, err := exec.LookPath("python3")
+			if err != nil {
+				t.Log("Python is unavailable; skipping mocked bootstrap execution")
+				return
+			}
+			if err := exec.Command(pythonPath, "-c", "import yaml").Run(); err != nil {
+				t.Log("PyYAML is unavailable; skipping mocked bootstrap execution")
+				return
+			}
+			output, err := exec.Command(pythonPath, "-c", `
+import pathlib
+import subprocess
+import sys
+import yaml
+
+config = yaml.safe_load(pathlib.Path(sys.argv[1]).read_text())
+commands = config["runcmd"]
+script = "\n".join(commands)
+subprocess.run(["sh", "-n"], input=script, text=True, check=True)
+setup = commands[0]
+setup_mock = """
+command() { return 1; }
+tdnf() {
+    test "$*" = 'install -y ca-certificates azure-cli jq curl python3 iptables' || exit 80
+    echo installed
+    az() { test "$*" = 'version --output none' || exit 81; }
+}
+"""
+result = subprocess.run(["sh", "-s"], input=setup_mock + setup, text=True, capture_output=True)
+assert result.returncode == 0 and 'installed' in result.stdout, result.stderr
+result = subprocess.run(["sh", "-s"], input="command() { return 1; }; tdnf() { return 42; };\n" + setup + "\necho should-not-run", text=True, capture_output=True)
+assert result.returncode == 42 and 'should-not-run' not in result.stdout
+bootstrap = commands[-1].split('\nsystemctl daemon-reload', 1)[0]
+assert 'systemctl' not in bootstrap
+if sys.argv[2] == 'control-plane':
+    for outcome, want in [('failure', 41), ('empty', 1), ('success', 0)]:
+        mock = '''set -eu
+az() { case "$OUTCOME" in failure) return 41 ;; empty) return 0 ;; *) printf 'p@ss/word' ;; esac; }
+sh() {
+    test "$POSTGRES_PASSWORD_ESCAPED" = 'p%40ss%2Fword' || exit 82
+    echo installer-started
+}
+'''
+        result = subprocess.run(['sh', '-s'], input=mock + bootstrap, text=True, capture_output=True, env={**__import__('os').environ, 'OUTCOME': outcome})
+        assert result.returncode == want, (outcome, result.returncode, result.stderr)
+        assert ('installer-started' in result.stdout) == (outcome == 'success')
+        assert 'p@ss/word' not in result.stdout + result.stderr
+print('rendered shell syntax and mocked bootstrap checks passed')
+`, configFile, role).CombinedOutput()
+			if err != nil {
+				t.Fatalf("bootstrap validation: %v\n%s", err, output)
+			}
+		})
 	}
 }
