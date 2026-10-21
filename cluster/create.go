@@ -21,7 +21,7 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
-	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/authorization/armauthorization"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/authorization/armauthorization/v2"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/keyvault/armkeyvault"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/msi/armmsi"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork"
@@ -95,6 +95,7 @@ func createKeyVault(ctx context.Context, subscriptionID, cluster, location, vnet
 		_, e := roleAssignmentsClient.Create(ctx, keyVaultID, certAdminRoleName, armauthorization.RoleAssignmentCreateParameters{
 			Properties: &armauthorization.RoleAssignmentProperties{
 				PrincipalID:      to.Ptr(msiPrincipalID),
+				PrincipalType:    to.Ptr(armauthorization.PrincipalTypeServicePrincipal),
 				RoleDefinitionID: to.Ptr(certAdminRoleDefID),
 			},
 		}, nil)
@@ -108,6 +109,7 @@ func createKeyVault(ctx context.Context, subscriptionID, cluster, location, vnet
 		_, e := roleAssignmentsClient.Create(ctx, keyVaultID, secretAdminRoleName, armauthorization.RoleAssignmentCreateParameters{
 			Properties: &armauthorization.RoleAssignmentProperties{
 				PrincipalID:      to.Ptr(msiPrincipalID),
+				PrincipalType:    to.Ptr(armauthorization.PrincipalTypeServicePrincipal),
 				RoleDefinitionID: to.Ptr(secretAdminRoleDefID),
 			},
 		}, nil)
@@ -121,6 +123,7 @@ func createKeyVault(ctx context.Context, subscriptionID, cluster, location, vnet
 		_, e := roleAssignmentsClient.Create(ctx, keyVaultID, certOfficerRoleName, armauthorization.RoleAssignmentCreateParameters{
 			Properties: &armauthorization.RoleAssignmentProperties{
 				PrincipalID:      to.Ptr(msiPrincipalID),
+				PrincipalType:    to.Ptr(armauthorization.PrincipalTypeServicePrincipal),
 				RoleDefinitionID: to.Ptr(certOfficerRoleDefID),
 			},
 		}, nil)
@@ -133,6 +136,7 @@ func createKeyVault(ctx context.Context, subscriptionID, cluster, location, vnet
 		_, e := roleAssignmentsClient.Create(ctx, keyVaultID, callingPrincipalRoleName, armauthorization.RoleAssignmentCreateParameters{
 			Properties: &armauthorization.RoleAssignmentProperties{
 				PrincipalID:      to.Ptr(callingPrincipalID),
+				PrincipalType:    to.Ptr(armauthorization.PrincipalTypeServicePrincipal),
 				RoleDefinitionID: to.Ptr(secretAdminRoleDefID),
 			},
 		}, nil)
@@ -335,6 +339,7 @@ func Create(args CreateArgs) error {
 	_, err = roleAssignmentsClient.Create(ctx, storageAccountID, roleAssignmentName, armauthorization.RoleAssignmentCreateParameters{
 		Properties: &armauthorization.RoleAssignmentProperties{
 			PrincipalID:      to.Ptr(msiPrincipalID),
+			PrincipalType:    to.Ptr(armauthorization.PrincipalTypeServicePrincipal),
 			RoleDefinitionID: to.Ptr(roleDefID),
 		},
 	}, nil)
@@ -348,6 +353,7 @@ func Create(args CreateArgs) error {
 	_, err = roleAssignmentsClient.Create(ctx, storageAccountID, tableRoleAssignmentName, armauthorization.RoleAssignmentCreateParameters{
 		Properties: &armauthorization.RoleAssignmentProperties{
 			PrincipalID:      to.Ptr(msiPrincipalID),
+			PrincipalType:    to.Ptr(armauthorization.PrincipalTypeServicePrincipal),
 			RoleDefinitionID: to.Ptr(tableRoleDefID),
 		},
 	}, nil)
@@ -508,6 +514,18 @@ func createVirtualNetwork(ctx context.Context, subscriptionID, resourceGroup, lo
 	return nil
 }
 
+func classifyAzurePostgresCreateError(err error) bool {
+	var respErr *azcore.ResponseError
+	if !errors.As(err, &respErr) {
+		return false
+	}
+	if respErr.ErrorCode == "PrivateDnsZoneNameNotValid" {
+		return true
+	}
+	statusCode := respErr.StatusCode
+	return statusCode == http.StatusRequestTimeout || statusCode == http.StatusConflict || statusCode == http.StatusTooManyRequests || (statusCode >= 500 && statusCode < 600)
+}
+
 // createPostgresFlexibleServer provisions an Azure PostgreSQL Flexible Server matching the Bicep module configuration
 func createPostgresFlexibleServer(ctx context.Context, subscriptionID, resourceGroup, location, vnetNamePrefix, adminUsername, adminPassword, serverName string, cred *azidentity.DefaultAzureCredential) error {
 	serversClient, err := armpostgresqlflexibleservers.NewServersClient(subscriptionID, cred, nil)
@@ -558,13 +576,17 @@ func createPostgresFlexibleServer(ctx context.Context, subscriptionID, resourceG
 		},
 	}
 
-	poller, err := serversClient.BeginCreate(ctx, resourceGroup, serverName, parameters, nil)
-	if err != nil {
-		return fmt.Errorf("failed to begin postgres server creation: %w", err)
-	}
-	_, err = poller.PollUntilDone(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("failed to create postgres server: %w", err)
+	if err := retry.RetryWithDelays(ctx, []time.Duration{10 * time.Second, 30 * time.Second, 60 * time.Second}, classifyAzurePostgresCreateError, func(ctx context.Context) error {
+		poller, err := serversClient.BeginCreate(ctx, resourceGroup, serverName, parameters, nil)
+		if err != nil {
+			return fmt.Errorf("failed to begin postgres server creation: %w", err)
+		}
+		if _, err := poller.PollUntilDone(ctx, nil); err != nil {
+			return fmt.Errorf("failed to create postgres server: %w", err)
+		}
+		return nil
+	}); err != nil {
+		return err
 	}
 
 	// Link the Postgres private DNS zone to the VNet
@@ -742,6 +764,7 @@ func createLoadBalancer(ctx context.Context, subscriptionID, resourceGroup, loca
 	_, err = roleAssignmentsClient.Create(ctx, privateDnsZoneID, privateDnsRoleAssignmentName, armauthorization.RoleAssignmentCreateParameters{
 		Properties: &armauthorization.RoleAssignmentProperties{
 			PrincipalID:      to.Ptr(msiPrincipalID),
+			PrincipalType:    to.Ptr(armauthorization.PrincipalTypeServicePrincipal),
 			RoleDefinitionID: to.Ptr(privateDnsRoleDefID),
 		},
 	}, nil)

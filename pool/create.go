@@ -52,6 +52,22 @@ func getCloudInitData(tmplData map[string]string) (string, error) {
 	return base64.StdEncoding.EncodeToString(renderedCloudInit.Bytes()), nil
 }
 
+func cloudInitTemplateData(subscriptionID, cluster, role, externalIP, k8sVersion string, msi *armmsi.Identity) map[string]string {
+	clusterHash := kstrings.UniqueString(cluster, subscriptionID)
+	return map[string]string{
+		"PostgresURL":        "",
+		"KeyVaultName":       fmt.Sprintf("k3akv%s", clusterHash),
+		"PostgresName":       fmt.Sprintf("k3apg%s", clusterHash),
+		"PostgresSuffix":     "postgres.database.azure.com",
+		"Role":               role,
+		"StorageAccountName": fmt.Sprintf("k3astorage%s", clusterHash),
+		"ResourceGroup":      cluster,
+		"ExternalIP":         externalIP,
+		"K8sVersion":         k8sVersion,
+		"MSIClientID":        *msi.Properties.ClientID,
+	}
+}
+
 // getManagedIdentity fetches the managed identity resource
 func getManagedIdentity(ctx context.Context, subscriptionID, cluster string, cred *azidentity.DefaultAzureCredential) (*armmsi.Identity, error) {
 	msiClient, err := armmsi.NewUserAssignedIdentitiesClient(subscriptionID, cred, nil)
@@ -255,23 +271,7 @@ func Create(args CreatePoolArgs) error {
 		userAssignedIdentities[id] = &armcompute.VirtualMachineScaleSetIdentityUserAssignedIdentitiesValue{}
 	}
 
-	keyVaultName := fmt.Sprintf("k3akv%s", clusterHash)
-	posgresName := fmt.Sprintf("k3apg%s", clusterHash)
-	storageAccountName := fmt.Sprintf("k3astorage%s", clusterHash)
-	tmplData := map[string]string{
-		"PostgresURL":        "",
-		"KeyVaultName":       keyVaultName,
-		"PostgresName":       posgresName,
-		"PostgresSuffix":     "postgres.database.azure.com",
-		"Role":               role,
-		"StorageAccountName": storageAccountName,
-		"ResourceGroup":      cluster,
-		"ExternalIP":         externalIP,
-		"K8sVersion":         args.K8sVersion, // Pass version to template
-		"MSIClientID":        *msi.Properties.ClientID,
-	}
-
-	customDataB64, err := getCloudInitData(tmplData)
+	customDataB64, err := getCloudInitData(cloudInitTemplateData(subscriptionID, cluster, role, externalIP, args.K8sVersion, msi))
 	if err != nil {
 		return err
 	}
@@ -304,12 +304,7 @@ func Create(args CreatePoolArgs) error {
 	}
 
 	storageProfile := &armcompute.VirtualMachineScaleSetStorageProfile{
-		ImageReference: &armcompute.ImageReference{
-			Publisher: to.Ptr("MicrosoftCblMariner"),
-			Offer:     to.Ptr("Cbl-Mariner"),
-			SKU:       to.Ptr("cbl-mariner-2-gen2"),
-			Version:   to.Ptr("latest"),
-		},
+		ImageReference: currentBaselineImageReference(),
 		OSDisk: &armcompute.VirtualMachineScaleSetOSDisk{
 			CreateOption: to.Ptr(armcompute.DiskCreateOptionTypesFromImage),
 			ManagedDisk: &armcompute.VirtualMachineScaleSetManagedDiskParameters{

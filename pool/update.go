@@ -15,6 +15,17 @@ type UpdateInstanceArgs struct {
 	InstanceID     string
 }
 
+func updateInstance(ctx context.Context, client *armcompute.VirtualMachineScaleSetVMsClient, cluster, vmssName, instanceID string) error {
+	poller, err := client.BeginUpdate(ctx, cluster, vmssName, instanceID, armcompute.VirtualMachineScaleSetVM{}, nil)
+	if err != nil {
+		return fmt.Errorf("failed to start update for VMSS instance: %w", err)
+	}
+	if _, err := poller.PollUntilDone(ctx, nil); err != nil {
+		return fmt.Errorf("failed to update VMSS instance: %w", err)
+	}
+	return nil
+}
+
 func UpdateInstance(args UpdateInstanceArgs) error {
 	cred, err := azidentity.NewDefaultAzureCredential(nil)
 	if err != nil {
@@ -26,13 +37,8 @@ func UpdateInstance(args UpdateInstanceArgs) error {
 		return fmt.Errorf("failed to create VMSS VMs client: %w", err)
 	}
 	vmssName := args.PoolName + "-vmss"
-	poller, err := vmssVMsClient.BeginUpdate(ctx, args.Cluster, vmssName, args.InstanceID, armcompute.VirtualMachineScaleSetVM{}, nil)
-	if err != nil {
-		return fmt.Errorf("failed to start update for VMSS instance: %w", err)
-	}
-	_, err = poller.PollUntilDone(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("failed to update VMSS instance: %w", err)
+	if err := updateInstance(ctx, vmssVMsClient, args.Cluster, vmssName, args.InstanceID); err != nil {
+		return err
 	}
 	fmt.Printf("Instance '%s' updated to latest model in pool '%s' (cluster '%s').\n", args.InstanceID, args.PoolName, args.Cluster)
 	return nil

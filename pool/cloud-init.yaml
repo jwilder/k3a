@@ -1,11 +1,14 @@
 #cloud-config
+# k3a-k8s-version: {{ .K8sVersion }}
 
 package_update: true
 packages:
+  - ca-certificates
   - jq
   - curl
   - azure-cli
   - python3
+  - iptables
 
 write_files:
   - path: /etc/rancher/k3s/registries.yaml
@@ -123,6 +126,12 @@ write_files:
 {{- end }}
 
 runcmd:
+  - |
+    set -eu
+    if ! command -v az >/dev/null 2>&1; then
+      tdnf install -y ca-certificates azure-cli jq curl python3 iptables
+    fi
+    az version --output none
   - iptables -A INPUT -p tcp --dport 6443 -j ACCEPT
   - iptables -A INPUT -p tcp --dport 443 -j ACCEPT
   - iptables -A INPUT -p tcp --dport 10250 -j ACCEPT
@@ -130,12 +139,18 @@ runcmd:
   - iptables -A INPUT -p udp --dport 5001 -j ACCEPT
   - iptables -A INPUT -p icmp -j ACCEPT
   - iptables -A INPUT -p udp --dport 8472 -j ACCEPT
-  - az login --identity --client-id "{{ .MSIClientID }}"
-  - export POSTGRES_PASSWORD=$(az keyvault secret show --vault-name "{{.KeyVaultName}}" --name "postgres-admin-password" --query value -o tsv)
-  - export POSTGRES_PASSWORD_ESCAPED=$(python3 -c "import urllib.parse,os; print(urllib.parse.quote(os.environ['POSTGRES_PASSWORD']))")
+  - az login --identity --client-id "{{ .MSIClientID }}" --output none
+  - curl -fsSL https://get.k3s.io -o /tmp/k3s-install.sh
   - |
     {{- if eq .Role "control-plane" }}
-    curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION="{{ .K8sVersion }}+k3s1" sh -s - server --token=SECRET --tls-san {{ .ExternalIP }} --embedded-registry --datastore-endpoint="postgres://azureuser:${POSTGRES_PASSWORD_ESCAPED}@{{.PostgresName}}.{{.PostgresSuffix}}:5432/postgres"
+    POSTGRES_PASSWORD=$(az keyvault secret show --vault-name "{{.KeyVaultName}}" --name "postgres-admin-password" --query value -o tsv --only-show-errors)
+    if [ -z "$POSTGRES_PASSWORD" ]; then
+      echo "PostgreSQL password is empty; refusing to start k3s." >&2
+      exit 1
+    fi
+    export POSTGRES_PASSWORD
+    POSTGRES_PASSWORD_ESCAPED=$(python3 -c "import urllib.parse,os; print(urllib.parse.quote(os.environ['POSTGRES_PASSWORD'], safe=''))")
+    INSTALL_K3S_VERSION="{{ .K8sVersion }}+k3s1" sh /tmp/k3s-install.sh server --token=SECRET --tls-san {{ .ExternalIP }} --embedded-registry --datastore-endpoint="postgres://azureuser:${POSTGRES_PASSWORD_ESCAPED}@{{.PostgresName}}.{{.PostgresSuffix}}:5432/postgres"
 
     systemctl daemon-reload
     systemctl enable --now k3s-node-labeler.service
@@ -149,13 +164,13 @@ runcmd:
       if [ -f "$KUBECONFIG_PATH" ]; then
         # Replace 127.0.0.1:6443 with provided external IP
         sed "s#https://127.0.0.1:6443#https://{{.ExternalIP}}:6443#g" "$KUBECONFIG_PATH" > "$KUBECONFIG_EXTERNAL_PATH"
-        az keyvault secret set --vault-name "{{.KeyVaultName}}" --name "kubeconfig-admin" --file "$KUBECONFIG_EXTERNAL_PATH"
+        az keyvault secret set --vault-name "{{.KeyVaultName}}" --name "kubeconfig-admin" --file "$KUBECONFIG_EXTERNAL_PATH" --output none
         break
       fi
       sleep 2
     done
 
     {{- else }}
-    curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION="{{ .K8sVersion }}+k3s1" sh -s - agent --token=SECRET --server https://kubernetes.cluster.internal:6443
+    INSTALL_K3S_VERSION="{{ .K8sVersion }}+k3s1" sh /tmp/k3s-install.sh agent --token=SECRET --server https://kubernetes.cluster.internal:6443
     sleep 5
     {{- end }}
