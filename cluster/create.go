@@ -21,7 +21,7 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
-	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/authorization/armauthorization"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/authorization/armauthorization/v2"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/keyvault/armkeyvault"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/msi/armmsi"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork"
@@ -95,6 +95,7 @@ func createKeyVault(ctx context.Context, subscriptionID, cluster, location, vnet
 		_, e := roleAssignmentsClient.Create(ctx, keyVaultID, certAdminRoleName, armauthorization.RoleAssignmentCreateParameters{
 			Properties: &armauthorization.RoleAssignmentProperties{
 				PrincipalID:      to.Ptr(msiPrincipalID),
+				PrincipalType:    to.Ptr(armauthorization.PrincipalTypeServicePrincipal),
 				RoleDefinitionID: to.Ptr(certAdminRoleDefID),
 			},
 		}, nil)
@@ -108,6 +109,7 @@ func createKeyVault(ctx context.Context, subscriptionID, cluster, location, vnet
 		_, e := roleAssignmentsClient.Create(ctx, keyVaultID, secretAdminRoleName, armauthorization.RoleAssignmentCreateParameters{
 			Properties: &armauthorization.RoleAssignmentProperties{
 				PrincipalID:      to.Ptr(msiPrincipalID),
+				PrincipalType:    to.Ptr(armauthorization.PrincipalTypeServicePrincipal),
 				RoleDefinitionID: to.Ptr(secretAdminRoleDefID),
 			},
 		}, nil)
@@ -121,6 +123,7 @@ func createKeyVault(ctx context.Context, subscriptionID, cluster, location, vnet
 		_, e := roleAssignmentsClient.Create(ctx, keyVaultID, certOfficerRoleName, armauthorization.RoleAssignmentCreateParameters{
 			Properties: &armauthorization.RoleAssignmentProperties{
 				PrincipalID:      to.Ptr(msiPrincipalID),
+				PrincipalType:    to.Ptr(armauthorization.PrincipalTypeServicePrincipal),
 				RoleDefinitionID: to.Ptr(certOfficerRoleDefID),
 			},
 		}, nil)
@@ -133,6 +136,7 @@ func createKeyVault(ctx context.Context, subscriptionID, cluster, location, vnet
 		_, e := roleAssignmentsClient.Create(ctx, keyVaultID, callingPrincipalRoleName, armauthorization.RoleAssignmentCreateParameters{
 			Properties: &armauthorization.RoleAssignmentProperties{
 				PrincipalID:      to.Ptr(callingPrincipalID),
+				PrincipalType:    to.Ptr(armauthorization.PrincipalTypeServicePrincipal),
 				RoleDefinitionID: to.Ptr(secretAdminRoleDefID),
 			},
 		}, nil)
@@ -335,6 +339,7 @@ func Create(args CreateArgs) error {
 	_, err = roleAssignmentsClient.Create(ctx, storageAccountID, roleAssignmentName, armauthorization.RoleAssignmentCreateParameters{
 		Properties: &armauthorization.RoleAssignmentProperties{
 			PrincipalID:      to.Ptr(msiPrincipalID),
+			PrincipalType:    to.Ptr(armauthorization.PrincipalTypeServicePrincipal),
 			RoleDefinitionID: to.Ptr(roleDefID),
 		},
 	}, nil)
@@ -348,6 +353,7 @@ func Create(args CreateArgs) error {
 	_, err = roleAssignmentsClient.Create(ctx, storageAccountID, tableRoleAssignmentName, armauthorization.RoleAssignmentCreateParameters{
 		Properties: &armauthorization.RoleAssignmentProperties{
 			PrincipalID:      to.Ptr(msiPrincipalID),
+			PrincipalType:    to.Ptr(armauthorization.PrincipalTypeServicePrincipal),
 			RoleDefinitionID: to.Ptr(tableRoleDefID),
 		},
 	}, nil)
@@ -758,6 +764,7 @@ func createLoadBalancer(ctx context.Context, subscriptionID, resourceGroup, loca
 	_, err = roleAssignmentsClient.Create(ctx, privateDnsZoneID, privateDnsRoleAssignmentName, armauthorization.RoleAssignmentCreateParameters{
 		Properties: &armauthorization.RoleAssignmentProperties{
 			PrincipalID:      to.Ptr(msiPrincipalID),
+			PrincipalType:    to.Ptr(armauthorization.PrincipalTypeServicePrincipal),
 			RoleDefinitionID: to.Ptr(privateDnsRoleDefID),
 		},
 	}, nil)
