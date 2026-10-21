@@ -26,7 +26,7 @@ Managing Kubernetes clusters and networking in Azure can be complex. k3a address
 ## Getting Started
 
 ### Prerequisites
-- Go 1.26 or later
+- Go 1.27 or later
 - Azure CLI installed and authenticated (`az login`)
 - `kubectl` installed (used internally by `k3a pool upgrade`)
 - Sufficient Azure permissions
